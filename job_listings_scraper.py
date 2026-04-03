@@ -699,10 +699,10 @@ class SAPJobListingsScraper:
 
     # ================== EXISTING KEYS ==================
     def get_existing_requisition_ids(self):
-        response = supabase.table("job_listings") \
+        response = supabase.table("jr_master") \
             .select("requisition_id").limit(10000).execute()
         existing = {r.get("requisition_id") for r in response.data if r.get("requisition_id")}
-        logging.info(f"Loaded {len(existing)} existing job_listings records")
+        logging.info(f"Loaded {len(existing)} existing jr_master records")
         return existing
 
     def filter_new_jobs(self, existing_ids):
@@ -743,7 +743,7 @@ class SAPJobListingsScraper:
                 continue
             for attempt in range(3):
                 try:
-                    supabase.table("job_listings").upsert(
+                    supabase.table("jr_master").upsert(
                         formatted,
                         on_conflict="requisition_id",
                         ignore_duplicates=False
@@ -786,7 +786,7 @@ def main():
         new_data = scraper.deduplicate_data(scraper.all_jobs)
         scraper.upload_supabase(new_data)
 
-        logging.info(f"DONE: {len(new_data)} records upserted to job_listings table")
+        logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 
     finally:
         scraper.close()

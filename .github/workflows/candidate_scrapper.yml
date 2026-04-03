@@ -1,0 +1,87 @@
+name: SAP Candidate Scraper
+
+on:
+  schedule:
+    - cron: '30 * * * *'   # Every hour at :30 (offset from job listings at :00)
+  workflow_dispatch:
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: |
+          pip install --no-cache-dir --upgrade pip
+          pip install --no-cache-dir \
+            "supabase==2.12.0" \
+            "httpx==0.27.2" \
+            "websockets==13.1" \
+            "selenium==4.20.0" \
+            "pandas==2.2.2" \
+            "python-dotenv==1.0.1" \
+            "python-dateutil==2.9.0" \
+            "openpyxl==3.1.2"
+          echo "--- Installed versions ---"
+          pip show supabase gotrue httpx | grep -E "Name|Version"
+
+      - name: Install Chrome
+        run: |
+          wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
+          echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" \
+            | sudo tee /etc/apt/sources.list.d/google-chrome.list
+          sudo apt-get update -q
+          sudo apt-get install -y google-chrome-stable
+          google-chrome --version
+
+      - name: Install ChromeDriver
+        run: |
+          CHROME_VER=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
+          echo "Chrome version: $CHROME_VER"
+          DRIVER_URL="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_VER}/linux64/chromedriver-linux64.zip"
+          wget -q "$DRIVER_URL" -O /tmp/chromedriver.zip
+          unzip -q /tmp/chromedriver.zip -d /tmp/
+          sudo mv /tmp/chromedriver-linux64/chromedriver /usr/local/bin/chromedriver
+          sudo chmod +x /usr/local/bin/chromedriver
+          chromedriver --version
+          echo "CHROMEDRIVER_PATH=/usr/local/bin/chromedriver" >> $GITHUB_ENV
+
+      - name: Create .env file
+        run: |
+          cat > .env << ENVEOF
+          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
+          SAP_COMPANY_ID=${{ secrets.SAP_COMPANY_ID }}
+          SAP_AGENCY_ID=${{ secrets.SAP_AGENCY_ID }}
+          SAP_EMAIL=${{ secrets.SAP_EMAIL }}
+          SAP_PASSWORD=${{ secrets.SAP_PASSWORD }}
+          CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
+          ENVEOF
+
+      - name: Run SAP candidate scraper
+        run: python candidate_scrapper.py
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: candidate-scraper-output-${{ github.run_id }}
+          path: |
+            *.log
+            *.xlsx
+            login_error.*
+            tab_switch_error.*
+            error_extract_*
+            error_candidate_*
+          retention-days: 7
+          if-no-files-found: ignore

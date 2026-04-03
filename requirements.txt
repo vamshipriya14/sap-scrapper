@@ -1,5 +1,6 @@
 selenium==4.20.0
-supabase==2.4.0
+supabase==2.3.4
+httpx==0.24.1
 pandas==2.2.2
 python-dotenv==1.0.1
 python-dateutil==2.9.0

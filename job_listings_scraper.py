@@ -8,6 +8,8 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.chrome.service import Service
+from webdriver_manager.chrome import ChromeDriverManager
 
 from supabase import create_client
 from dotenv import load_dotenv
@@ -66,7 +68,7 @@ class SAPJobListingsScraper:
         options.add_argument("--log-level=3")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
-        self.driver = webdriver.Chrome(options=options)
+        self.driver = webdriver.Chrome(service=Service("/home/codespace/.wdm/drivers/chromedriver/linux64/146.0.7680.165/chromedriver-linux64/chromedriver"), options=options)
         self.wait = WebDriverWait(self.driver, 15)
 
     # ================== LOGIN ==================

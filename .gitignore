@@ -7,3 +7,4 @@ error_job_*
 __pycache__/
 *.pyc
 .DS_Store
+.venv/

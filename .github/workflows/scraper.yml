@@ -2,8 +2,8 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *'   # Every hour at :00
-  workflow_dispatch:       # Manual trigger from GitHub UI
+    - cron: '0 * * * *'
+  workflow_dispatch:
 
 jobs:
   scrape:
@@ -11,22 +11,31 @@ jobs:
     timeout-minutes: 55
 
     steps:
-      # ── 1. Checkout code ──────────────────────────────────────────────────
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # ── 2. Python setup ───────────────────────────────────────────────────
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
           cache: 'pip'
 
-      # ── 3. Install Python dependencies ────────────────────────────────────
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: |
+          pip install --no-cache-dir --upgrade pip
+          pip install --no-cache-dir \
+            "supabase==2.12.0" \
+            "httpx==0.27.2" \
+            "websockets==13.1" \
+            "selenium==4.20.0" \
+            "pandas==2.2.2" \
+            "python-dotenv==1.0.1" \
+            "python-dateutil==2.9.0" \
+            "openpyxl==3.1.2" \
+            "webdriver-manager==4.0.1"
+          echo "--- Installed versions ---"
+          pip show supabase gotrue httpx websockets | grep -E "Name|Version"
 
-      # ── 4. Install Chrome ─────────────────────────────────────────────────
       - name: Install Chrome
         run: |
           wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | sudo apt-key add -
@@ -36,7 +45,6 @@ jobs:
           sudo apt-get install -y google-chrome-stable
           google-chrome --version
 
-      # ── 5. Install ChromeDriver to match Chrome version ───────────────────
       - name: Install ChromeDriver
         run: |
           CHROME_VER=$(google-chrome --version | grep -oP '\d+\.\d+\.\d+\.\d+')
@@ -49,10 +57,9 @@ jobs:
           chromedriver --version
           echo "CHROMEDRIVER_PATH=/usr/local/bin/chromedriver" >> $GITHUB_ENV
 
-      # ── 6. Write .env from GitHub Secrets ─────────────────────────────────
       - name: Create .env file
         run: |
-          cat > .env << EOF
+          cat > .env << ENVEOF
           SUPABASE_URL=${{ secrets.SUPABASE_URL }}
           SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
           SAP_COMPANY_ID=${{ secrets.SAP_COMPANY_ID }}
@@ -60,13 +67,11 @@ jobs:
           SAP_EMAIL=${{ secrets.SAP_EMAIL }}
           SAP_PASSWORD=${{ secrets.SAP_PASSWORD }}
           CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
-          EOF
+          ENVEOF
 
-      # ── 7. Run the scraper ────────────────────────────────────────────────
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
 
-      # ── 8. Upload logs and Excel for debugging ────────────────────────────
       - name: Upload artifacts
         if: always()
         uses: actions/upload-artifact@v4
@@ -78,3 +83,4 @@ jobs:
             login_error.*
             error_job_*
           retention-days: 7
+          if-no-files-found: ignore

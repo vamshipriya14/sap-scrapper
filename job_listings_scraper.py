@@ -68,7 +68,8 @@ class SAPJobListingsScraper:
         options.add_argument("--log-level=3")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
-        self.driver = webdriver.Chrome(service=Service("/home/codespace/.wdm/drivers/chromedriver/linux64/146.0.7680.165/chromedriver-linux64/chromedriver"), options=options)
+        driver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
+        self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
         self.wait = WebDriverWait(self.driver, 15)
 
     # ================== LOGIN ==================

@@ -784,7 +784,7 @@ def main():
         scraper.save_excel()
 
         new_data = scraper.deduplicate_data(scraper.all_jobs)
-        scraper.upload_supabase(new_data)
+        #scraper.upload_supabase(new_data)
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 

@@ -723,6 +723,9 @@ class SAPJobListingsScraper:
         data = self.deduplicate_data(data)
         logging.info(f"Uploading {len(data)} job listing records...")
 
+        today = datetime.now().date()
+        now_iso = datetime.now().isoformat()
+
         batch_size = 25
         for i in range(0, len(data), batch_size):
             formatted = []
@@ -730,22 +733,38 @@ class SAPJobListingsScraper:
                 req_id = self.clean(row.get("requisition_id"))
                 if not req_id:
                     continue
+
+                # ── jr_status based on posting_end_date ──
+                end_date_str = row.get("posting_end_date")
+                parsed_end = self.parse_date(end_date_str)  # returns "YYYY-MM-DD" or None
+                if parsed_end:
+                    from datetime import date
+                    jr_status = "active" if date.fromisoformat(parsed_end) >= today else "inactive"
+                else:
+                    jr_status = "active"  # no end date → treat as active
+
                 formatted.append({
-                    "requisition_id":     req_id,
-                    "job_title":          self.clean_text(row.get("job_title")),
+                    "jr_no": req_id,
+                    "skill_name": self.clean_text(row.get("job_title")),
                     "posting_start_date": self.parse_date(row.get("posting_start_date")),
-                    "posting_end_date":   self.parse_date(row.get("posting_end_date")),
-                    "recruiter_name":     self.clean_text(row.get("recruiter_name")),
-                    "recruiter_email":    self.clean(row.get("recruiter_email")).lower(),
-                    "job_details":        row.get("job_details"),
+                    "posting_end_date": parsed_end,
+                    "client_recruiter": self.clean_text(row.get("recruiter_name")),
+                    "recruiter_email": self.clean(row.get("recruiter_email")).lower(),
+                    "job_details": row.get("job_details"),
+                    "company_name": "BS",  # ← fixed column name
+                    "jr_status": jr_status,  # ← new field
+                    "modified_date": now_iso,  # ← always stamp on upsert
+                    # created_by / modified_by omitted — let DB default (auth.uid()) handle it
                 })
+
             if not formatted:
                 continue
+
             for attempt in range(3):
                 try:
                     supabase.table("jr_master").upsert(
                         formatted,
-                        on_conflict="requisition_id",
+                        on_conflict="jr_no",  # ← fixed: matches unique constraint
                         ignore_duplicates=False
                     ).execute()
                     logging.info(f"Upserted batch {i // batch_size + 1}: {len(formatted)} records")

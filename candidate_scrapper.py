@@ -569,7 +569,7 @@ class SAPCDPScraper:
                     "date": self.parse_date(row.get("Created_On")),
                     "rights_expire": self.parse_date(row.get("Rights_Expire")),
                     "forwarded_on": self.parse_date(row.get("Forwarded_On")),
-                    "requisition_id": self.clean(row.get("Requisition_ID")),
+                    "jr_no": self.clean(row.get("Requisition_ID")),
                     "job_title": self.clean_text(row.get("Job_Title")),
                     "status": self.clean_text(row.get("Status")),
                     "company": "BS",

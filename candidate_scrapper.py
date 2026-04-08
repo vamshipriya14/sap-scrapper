@@ -172,7 +172,7 @@ class SAPCDPScraper:
         logging.info("Successfully switched to Candidates tab")
 
     # ================== SCROLL ==================
-    def scroll_and_load_all(self, limit=1000):
+    def scroll_and_load_all(self, limit=100):
         """Scroll only until required number of candidates are loaded"""
 
         logging.info(f"Loading up to {limit} candidates...")
@@ -631,7 +631,7 @@ def main():
 
     try:
         scraper.login()
-        scraper.scroll_and_load_all(limit=1000)
+        scraper.scroll_and_load_all(limit=100)
         scraper.extract_all_loaded()
         scraper.save_excel()
 

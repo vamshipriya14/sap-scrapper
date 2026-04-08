@@ -738,9 +738,6 @@ class SAPJobListingsScraper:
                     "recruiter_name":     self.clean_text(row.get("recruiter_name")),
                     "recruiter_email":    self.clean(row.get("recruiter_email")).lower(),
                     "job_details":        row.get("job_details"),
-                    "company":            "BS",
-                    "created_by":         "bot",
-                    "created_at":         datetime.utcnow().isoformat(),
                 })
             if not formatted:
                 continue

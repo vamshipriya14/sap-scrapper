@@ -180,6 +180,73 @@ def reset_new_jr_to_active() -> None:
         logging.error(f"reset_new_jr_to_active failed: {e}")
 
 
+def fetch_highlights() -> dict:
+    """Fetch new jr rows and today's deactivated rows for the email highlights table."""
+    today_start = date.today().isoformat() + "T00:00:00"
+    cols = "jr_no, skill_name, client_recruiter, jr_status"
+    try:
+        new_resp = (
+            supabase.table("jr_master")
+            .select(cols)
+            .eq("jr_status", "new jr")
+            .order("jr_no")
+            .execute()
+        )
+        new_rows = new_resp.data or []
+    except Exception as e:
+        logging.warning(f"fetch_highlights new_jr failed: {e}")
+        new_rows = []
+
+    try:
+        deact_resp = (
+            supabase.table("jr_master")
+            .select(cols)
+            .eq("jr_status", "inactive")
+            .gte("modified_date", today_start)
+            .order("jr_no")
+            .execute()
+        )
+        deact_rows = deact_resp.data or []
+    except Exception as e:
+        logging.warning(f"fetch_highlights deactivated failed: {e}")
+        deact_rows = []
+
+    return {"new_jr": new_rows, "deactivated": deact_rows}
+
+
+def fetch_summary_counts() -> dict:
+    """Fetch total active and new jr counts for the summary cards."""
+    today_start = date.today().isoformat() + "T00:00:00"
+    try:
+        active_resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
+        active_count = len(active_resp.data or [])
+    except Exception as e:
+        logging.warning(f"fetch_summary active count failed: {e}")
+        active_count = 0
+
+    try:
+        new_resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "new jr").execute()
+        new_count = len(new_resp.data or [])
+    except Exception as e:
+        logging.warning(f"fetch_summary new jr count failed: {e}")
+        new_count = 0
+
+    try:
+        deact_resp = (
+            supabase.table("jr_master")
+            .select("jr_no")
+            .eq("jr_status", "inactive")
+            .gte("modified_date", today_start)
+            .execute()
+        )
+        deact_count = len(deact_resp.data or [])
+    except Exception as e:
+        logging.warning(f"fetch_summary deactivated count failed: {e}")
+        deact_count = 0
+
+    return {"active": active_count, "new_jr": new_count, "deactivated": deact_count}
+
+
 # ─────────────────────────────────────────────
 # EXCEL BUILDER
 # ─────────────────────────────────────────────
@@ -260,27 +327,76 @@ def build_excel(records: list) -> bytes:
 # ─────────────────────────────────────────────
 # HTML BODY
 # ─────────────────────────────────────────────
-def build_html_body(today_new: int, yesterday_new: int) -> str:
-    today_str = datetime.now().strftime("%B %d, %Y")
+def _highlights_table_html(rows: list, status: str) -> str:
+    """Build an HTML table for new jr or deactivated rows."""
+    if not rows:
+        return ""
+    color   = "#00B050" if status == "new jr" else "#CC0000"
+    label   = "New JR" if status == "new jr" else "Deactivated Today"
+    bg      = "#f0fff4" if status == "new jr" else "#fff5f5"
+    rows_html = ""
+    for r in rows:
+        recruiter = r.get("client_recruiter") or "—"
+        rows_html += (
+            f"<tr>"
+            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{r.get('jr_no','')}</td>"
+            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{r.get('skill_name','')}</td>"
+            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{recruiter}</td>"
+            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;text-align:center;'>"
+            f"<span style='background:{color};color:#fff;border-radius:10px;padding:2px 10px;font-size:11.5px;font-weight:700;'>{label}</span>"
+            f"</td>"
+            f"</tr>"
+        )
+    return f"""
+<p style="margin:18px 0 6px;font-size:13.5px;font-weight:600;color:#333;">{label} — {len(rows)} record(s)</p>
+<table style="width:100%;border-collapse:collapse;background:{bg};border-radius:6px;overflow:hidden;font-family:'Segoe UI',Arial,sans-serif;">
+  <thead>
+    <tr style="background:{color};">
+      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">JR No</th>
+      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">Job Title</th>
+      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">Recruiter</th>
+      <th style="padding:8px 10px;text-align:center;color:#fff;font-size:12px;font-weight:600;">Status</th>
+    </tr>
+  </thead>
+  <tbody>{rows_html}</tbody>
+</table>"""
+
+
+def build_html_body(summary: dict, highlights: dict) -> str:
+    today_str   = datetime.now().strftime("%B %d, %Y")
+    active_cnt  = summary.get("active", 0)
+    new_cnt     = summary.get("new_jr", 0)
+    deact_cnt   = summary.get("deactivated", 0)
+
+    new_table   = _highlights_table_html(highlights.get("new_jr", []),    "new jr")
+    deact_table = _highlights_table_html(highlights.get("deactivated", []), "inactive")
+
     return f"""<!DOCTYPE html>
 <html>
 <head>
   <meta charset="UTF-8">
   <style>
     body {{ font-family:'Segoe UI',Arial,sans-serif; background:#f4f6f9; margin:0; padding:0; }}
-    .wrapper {{ max-width:620px; margin:30px auto; background:#fff; border-radius:8px;
+    .wrapper {{ max-width:640px; margin:30px auto; background:#fff; border-radius:8px;
                 overflow:hidden; box-shadow:0 2px 8px rgba(0,0,0,.12); }}
     .header  {{ background:#1F4E79; padding:22px 30px; color:#fff; }}
     .header h2 {{ margin:0; font-size:18px; letter-spacing:.5px; }}
     .header p  {{ margin:4px 0 0; font-size:13px; color:#cde0f5; }}
     .body    {{ padding:28px 30px; color:#333; font-size:14.5px; line-height:1.7; }}
-    .stats-box {{ background:#f0f6ff; border-left:4px solid #1F4E79; border-radius:4px;
-                  padding:14px 20px; margin:18px 0; }}
-    .stat-line {{ display:flex; align-items:center; margin:6px 0; font-size:14px; font-weight:600; }}
-    .stat-label {{ color:#555; font-weight:400; min-width:240px; }}
-    .badge {{ display:inline-block; border-radius:12px; padding:2px 14px; font-weight:700; font-size:13px; }}
-    .badge-today     {{ background:#e8f5e9; color:#2e7d32; }}
-    .badge-yesterday {{ background:#fff3e0; color:#e65100; }}
+    .summary-cards {{ display:flex; gap:12px; margin:18px 0; }}
+    .card {{ flex:1; border-radius:8px; padding:14px 16px; text-align:center; }}
+    .card-label {{ font-size:11.5px; font-weight:600; text-transform:uppercase;
+                   letter-spacing:.5px; margin-bottom:6px; }}
+    .card-value {{ font-size:26px; font-weight:700; }}
+    .card-active   {{ background:#e8f0fb; }}
+    .card-active   .card-label {{ color:#1a56a0; }}
+    .card-active   .card-value {{ color:#1a56a0; }}
+    .card-new      {{ background:#e8f5e9; }}
+    .card-new      .card-label {{ color:#1e7e34; }}
+    .card-new      .card-value {{ color:#1e7e34; }}
+    .card-deact    {{ background:#fdecea; }}
+    .card-deact    .card-label {{ color:#b71c1c; }}
+    .card-deact    .card-value {{ color:#b71c1c; }}
     .legend {{ display:flex; gap:16px; margin:18px 0; flex-wrap:wrap; }}
     .legend-item {{ display:flex; align-items:center; gap:6px; font-size:13px; color:#444; }}
     .dot {{ width:12px; height:12px; border-radius:50%; display:inline-block; }}
@@ -302,17 +418,26 @@ def build_html_body(today_new: int, yesterday_new: int) -> str:
     <p>Dear Team,</p>
     <p>Please find attached the <strong>data extract</strong> as requested, along with
        today's <strong>active job listings</strong> (posting end date &gt; today).</p>
-    <div class="stats-box">
-      <div class="stat-line">
-        <span class="stat-label">*** Today's New Postings Found:</span>
-        <span class="badge badge-today">&nbsp;{today_new}&nbsp;</span>
+
+    <div class="summary-cards">
+      <div class="card card-active">
+        <div class="card-label">Active JRs</div>
+        <div class="card-value">{active_cnt}</div>
       </div>
-      <div class="stat-line">
-        <span class="stat-label">*** Yesterday's New Postings Found:</span>
-        <span class="badge badge-yesterday">&nbsp;{yesterday_new}&nbsp;</span>
+      <div class="card card-new">
+        <div class="card-label">New JRs</div>
+        <div class="card-value">{new_cnt}</div>
+      </div>
+      <div class="card card-deact">
+        <div class="card-label">Deactivated Today</div>
+        <div class="card-value">{deact_cnt}</div>
       </div>
     </div>
-    <p><strong>Excel Status Legend:</strong></p>
+
+    {new_table}
+    {deact_table}
+
+    <p style="margin-top:20px;"><strong>Excel Status Legend:</strong></p>
     <div class="legend">
       <span class="legend-item"><span class="dot dot-new"></span> New JR &ndash; Newly added posting</span>
       <span class="legend-item"><span class="dot dot-active"></span> Active &ndash; Posting end date in future</span>
@@ -337,11 +462,14 @@ def build_html_body(today_new: int, yesterday_new: int) -> str:
 def send_email():
     logging.info("=== Starting daily email job ===")
 
-    # 1. Fetch & count
-    records       = fetch_active_jobs()
-    today_new     = count_new_jrs(records)
-    yesterday_new = count_yesterday_new_jrs()
-    logging.info(f"Records: {len(records)} | Today new: {today_new} | Yesterday new: {yesterday_new}")
+    # 1. Fetch data
+    records    = fetch_active_jobs()
+    summary    = fetch_summary_counts()
+    highlights = fetch_highlights()
+    logging.info(
+        f"Records: {len(records)} | Active: {summary['active']} | "
+        f"New JR: {summary['new_jr']} | Deactivated today: {summary['deactivated']}"
+    )
 
     # 2. Excel attachment
     excel_bytes = build_excel(records)
@@ -365,7 +493,7 @@ def send_email():
     payload = {
         "message": {
             "subject": subject,
-            "body": {"contentType": "HTML", "content": build_html_body(today_new, yesterday_new)},
+            "body": {"contentType": "HTML", "content": build_html_body(summary, highlights)},
             "toRecipients": to_recipients,
             **({"ccRecipients": cc_recipients} if cc_recipients else {}),
             "attachments": [{

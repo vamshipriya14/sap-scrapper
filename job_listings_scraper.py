@@ -784,17 +784,15 @@ class SAPJobListingsScraper:
         self.driver.quit()
 
 
-    def mark_inactive_and_new(self, extracted_jr_nos: set):
+    def mark_inactive_and_new(self, extracted_jr_nos: set, pre_upload_jr_nos: set):
         """
-        1. Fetch every jr_no currently in the DB.
+        1. Uses pre_upload_jr_nos (fetched BEFORE upload) to correctly identify new records.
         2. Any DB record whose jr_no is NOT in extracted_jr_nos  → set jr_status = 'inactive'.
-        3. Any record that WAS in extracted_jr_nos but was NOT in the DB before this run
-           → set jr_status = 'new jr'  (the upsert in upload_supabase already inserted them;
-             this step just stamps the status correctly).
+        3. Any record in extracted_jr_nos but NOT in pre_upload_jr_nos → set jr_status = 'new jr'.
         """
         now_iso = datetime.now().isoformat()
 
-        # ── Step 1: fetch all existing jr_nos from DB ──
+        # ── Step 1: fetch current DB state (post-upload, used only for deactivation) ──
         resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
         all_db_records = {r["jr_no"]: r["jr_status"] for r in (resp.data or [])}
         logging.info(f"Total records in DB: {len(all_db_records)}")
@@ -826,7 +824,7 @@ class SAPJobListingsScraper:
         # 'active' after a successful send — so 'new jr' is just a temporary "unsent" flag.
         to_mark_new = [
             jr_no for jr_no in extracted_jr_nos
-            if jr_no not in all_db_records  # wasn't in DB at the start of this run
+            if jr_no not in pre_upload_jr_nos  # wasn't in DB BEFORE this run's upload
         ]
         logging.info(f"Records to mark as 'new jr': {len(to_mark_new)}")
 
@@ -870,13 +868,18 @@ def main():
             if scraper.clean(r.get("requisition_id"))
         }
 
+        # ── Snapshot DB state BEFORE upload so we can identify truly new records ──
+        pre_resp = supabase.table("jr_master").select("jr_no").limit(10000).execute()
+        pre_upload_jr_nos = {r["jr_no"] for r in (pre_resp.data or [])}
+        logging.info(f"Pre-upload DB snapshot: {len(pre_upload_jr_nos)} existing records")
+
         # ── Upload new / updated records (upsert) ──
         new_data = scraper.deduplicate_data(scraper.all_jobs)
         scraper.upload_supabase(new_data)
 
         # ── Mark records missing from today's extract as inactive;
         #    mark brand-new records as 'new jr' ──
-        scraper.mark_inactive_and_new(extracted_jr_nos)
+        scraper.mark_inactive_and_new(extracted_jr_nos, pre_upload_jr_nos)
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 

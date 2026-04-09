@@ -751,11 +751,13 @@ class SAPJobListingsScraper:
                     "client_recruiter": self.clean_text(row.get("recruiter_name")),
                     "recruiter_email": self.clean(row.get("recruiter_email")).lower(),
                     "job_details": row.get("job_details"),
-                    "company_name": "BS",  # ← fixed column name
-                    "jr_status": jr_status,  # ← new field
-                    "modified_date": now_iso,  # ← always stamp on upsert
-                    # created_by / modified_by omitted — let DB default (auth.uid()) handle it
-                })
+                    "company_name": "BS",
+                    "jr_status": jr_status,       # always "active" or "inactive" — never "new jr"
+                    "modified_date": now_iso,
+                    # is_new_jr & first_seen_date intentionally excluded:
+                    #   -> on INSERT: DB defaults set is_new_jr=true, first_seen_date=today
+                    #   -> on UPDATE: existing values preserved (not in upsert payload)
+                    # created_by / modified_by omitted — let DB default handle it
 
             if not formatted:
                 continue
@@ -785,6 +787,68 @@ class SAPJobListingsScraper:
         self.driver.quit()
 
 
+    def mark_inactive_and_new(self, extracted_jr_nos: set):
+        """
+        1. Fetch every jr_no currently in the DB.
+        2. Any DB record whose jr_no is NOT in extracted_jr_nos  → set jr_status = 'inactive'.
+        3. Any record that WAS in extracted_jr_nos but was NOT in the DB before this run
+           → set jr_status = 'new jr'  (the upsert in upload_supabase already inserted them;
+             this step just stamps the status correctly).
+        """
+        now_iso = datetime.now().isoformat()
+
+        # ── Step 1: fetch all existing jr_nos from DB ──
+        resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
+        all_db_records = {r["jr_no"]: r["jr_status"] for r in (resp.data or [])}
+        logging.info(f"Total records in DB: {len(all_db_records)}")
+
+        # ── Step 2: mark missing records as inactive ──
+        to_deactivate = [
+            jr_no for jr_no, status in all_db_records.items()
+            if jr_no not in extracted_jr_nos and status != "inactive"
+        ]
+        logging.info(f"Records to mark inactive: {len(to_deactivate)}")
+
+        batch_size = 50
+        for i in range(0, len(to_deactivate), batch_size):
+            batch = to_deactivate[i: i + batch_size]
+            for attempt in range(3):
+                try:
+                    supabase.table("jr_master").update(
+                        {"jr_status": "inactive", "modified_date": now_iso}
+                    ).in_("jr_no", batch).execute()
+                    logging.info(f"  Deactivated batch {i // batch_size + 1}: {len(batch)} records")
+                    break
+                except Exception as e:
+                    logging.error(f"  Deactivate batch attempt {attempt + 1} failed: {e}")
+                    time.sleep(2)
+
+        # ── Step 3: mark brand-new records as 'new jr' ──
+        # upload_supabase set them to 'active'/'inactive'; we override to 'new jr' here
+        # so the email script can identify them. The email script resets them back to
+        # 'active' after a successful send — so 'new jr' is just a temporary "unsent" flag.
+        to_mark_new = [
+            jr_no for jr_no in extracted_jr_nos
+            if jr_no not in all_db_records  # wasn't in DB at the start of this run
+        ]
+        logging.info(f"Records to mark as 'new jr': {len(to_mark_new)}")
+
+        for i in range(0, len(to_mark_new), batch_size):
+            batch = to_mark_new[i: i + batch_size]
+            for attempt in range(3):
+                try:
+                    supabase.table("jr_master").update(
+                        {"jr_status": "new jr", "modified_date": now_iso}
+                    ).in_("jr_no", batch).execute()
+                    logging.info(f"  Marked new jr batch {i // batch_size + 1}: {len(batch)} records")
+                    break
+                except Exception as e:
+                    logging.error(f"  Mark-new batch attempt {attempt + 1} failed: {e}")
+                    time.sleep(2)
+
+        logging.info("mark_inactive_and_new complete.")
+
+
 # ================== MAIN ==================
 def main():
     scraper = SAPJobListingsScraper("https://agencysvc44.sapsf.com/login")
@@ -802,14 +866,25 @@ def main():
 
         scraper.save_excel()
 
+        # ── Collect the set of jr_nos extracted in THIS run ──
+        extracted_jr_nos = {
+            scraper.clean(r.get("requisition_id"))
+            for r in scraper.all_jobs
+            if scraper.clean(r.get("requisition_id"))
+        }
+
+        # ── Upload new / updated records (upsert) ──
         new_data = scraper.deduplicate_data(scraper.all_jobs)
         scraper.upload_supabase(new_data)
+
+        # ── Mark records missing from today's extract as inactive;
+        #    mark brand-new records as 'new jr' ──
+        scraper.mark_inactive_and_new(extracted_jr_nos)
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 
     finally:
         scraper.close()
-
 
 if __name__ == "__main__":
     main()

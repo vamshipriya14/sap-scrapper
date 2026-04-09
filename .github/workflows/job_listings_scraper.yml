@@ -2,7 +2,7 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '0 * * * *'
+    - cron: '0 3 * * *'  # 08:30 IST daily — adjust timezone offset if needed
   workflow_dispatch:
 
 jobs:
@@ -31,7 +31,9 @@ jobs:
             "python-dotenv==1.0.1" \
             "python-dateutil==2.9.0" \
             "openpyxl==3.1.2" \
-            "webdriver-manager==4.0.1"
+            "webdriver-manager==4.0.1" \
+            "azure-identity==1.17.1" \
+            "msgraph-sdk==1.5.4"
           echo "--- Installed versions ---"
           pip show supabase gotrue httpx websockets | grep -E "Name|Version"
 
@@ -66,10 +68,20 @@ jobs:
           SAP_EMAIL=${{ secrets.SAP_EMAIL }}
           SAP_PASSWORD=${{ secrets.SAP_PASSWORD }}
           CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
+          AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }}
+          EMAIL_FROM=${{ secrets.EMAIL_FROM }}
+          EMAIL_TO=${{ secrets.EMAIL_TO }}
+          EMAIL_CC=${{ secrets.EMAIL_CC }}
           ENVEOF
 
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
+
+      - name: Send daily email report
+        if: always()   # send even if scraper had partial failures
+        run: python send_daily_email.py --now
 
       - name: Upload artifacts
         if: always()

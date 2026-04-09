@@ -318,6 +318,8 @@ def build_html_body(today_new: int, yesterday_new: int) -> str:
       <span class="legend-item"><span class="dot dot-active"></span> Active &ndash; Posting end date in future</span>
       <span class="legend-item"><span class="dot dot-inactive"></span> Inactive &ndash; Expired / not in latest extract</span>
     </div>
+    <p>For full job details and requirements, please refer to the
+       <a href="https://hr-data-ui-volibits.streamlit.app/#job-requirements" style="color:#1F4E79;font-weight:600;">ATS Portal</a>.</p>
     <p>If any clarification is required, our automation desk remains at your service.</p>
   </div>
   <div class="footer">

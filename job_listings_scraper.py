@@ -754,10 +754,7 @@ class SAPJobListingsScraper:
                     "company_name": "BS",
                     "jr_status": jr_status,       # always "active" or "inactive" — never "new jr"
                     "modified_date": now_iso,
-                    # is_new_jr & first_seen_date intentionally excluded:
-                    #   -> on INSERT: DB defaults set is_new_jr=true, first_seen_date=today
-                    #   -> on UPDATE: existing values preserved (not in upsert payload)
-                    # created_by / modified_by omitted — let DB default handle it
+                })
 
             if not formatted:
                 continue

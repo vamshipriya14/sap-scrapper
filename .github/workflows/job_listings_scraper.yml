@@ -2,7 +2,7 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '0 3 * * *'  # 08:30 IST daily — adjust timezone offset if needed
+    - cron: '0 3 * * *'  # 08:30 IST (UTC+5:30)
   workflow_dispatch:
 
 jobs:
@@ -33,9 +33,10 @@ jobs:
             "openpyxl==3.1.2" \
             "webdriver-manager==4.0.1" \
             "azure-identity==1.17.1" \
-            "msgraph-sdk==1.5.4"
+            "msgraph-sdk==1.5.4" \
+            "requests>=2.31.0"
           echo "--- Installed versions ---"
-          pip show supabase gotrue httpx websockets | grep -E "Name|Version"
+          pip show supabase gotrue httpx websockets requests | grep -E "Name|Version"
 
       - name: Install Chrome
         run: |
@@ -60,28 +61,39 @@ jobs:
 
       - name: Create .env file
         run: |
-          cat > .env << ENVEOF
-          SUPABASE_URL=${{ secrets.SUPABASE_URL }}
-          SUPABASE_KEY=${{ secrets.SUPABASE_KEY }}
-          SAP_COMPANY_ID=${{ secrets.SAP_COMPANY_ID }}
-          SAP_AGENCY_ID=${{ secrets.SAP_AGENCY_ID }}
-          SAP_EMAIL=${{ secrets.SAP_EMAIL }}
-          SAP_PASSWORD=${{ secrets.SAP_PASSWORD }}
-          CHROMEDRIVER_PATH=/usr/local/bin/chromedriver
-          AZURE_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}
-          AZURE_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}
-          AZURE_CLIENT_SECRET=${{ secrets.AZURE_CLIENT_SECRET }}
-          EMAIL_FROM=${{ secrets.EMAIL_FROM }}
-          EMAIL_TO=${{ secrets.EMAIL_TO }}
-          EMAIL_CC=${{ secrets.EMAIL_CC }}
-          ENVEOF
+          printf "SUPABASE_URL=%s\n"        "$SUPABASE_URL"        >  .env
+          printf "SUPABASE_KEY=%s\n"        "$SUPABASE_KEY"        >> .env
+          printf "SAP_COMPANY_ID=%s\n"      "$SAP_COMPANY_ID"      >> .env
+          printf "SAP_AGENCY_ID=%s\n"       "$SAP_AGENCY_ID"       >> .env
+          printf "SAP_EMAIL=%s\n"           "$SAP_EMAIL"           >> .env
+          printf "SAP_PASSWORD=%s\n"        "$SAP_PASSWORD"        >> .env
+          printf "CHROMEDRIVER_PATH=/usr/local/bin/chromedriver\n" >> .env
+          printf "AZURE_TENANT_ID=%s\n"     "$AZURE_TENANT_ID"     >> .env
+          printf "AZURE_CLIENT_ID=%s\n"     "$AZURE_CLIENT_ID"     >> .env
+          printf "AZURE_CLIENT_SECRET=%s\n" "$AZURE_CLIENT_SECRET" >> .env
+          printf "EMAIL_FROM=%s\n"          "$EMAIL_FROM"          >> .env
+          printf "EMAIL_TO=%s\n"            "$EMAIL_TO"            >> .env
+          printf "EMAIL_CC=%s\n"            "$EMAIL_CC"            >> .env
+        env:
+          SUPABASE_URL:        ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY:        ${{ secrets.SUPABASE_KEY }}
+          SAP_COMPANY_ID:      ${{ secrets.SAP_COMPANY_ID }}
+          SAP_AGENCY_ID:       ${{ secrets.SAP_AGENCY_ID }}
+          SAP_EMAIL:           ${{ secrets.SAP_EMAIL }}
+          SAP_PASSWORD:        ${{ secrets.SAP_PASSWORD }}
+          AZURE_TENANT_ID:     ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_CLIENT_ID:     ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          EMAIL_FROM:          ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO:            ${{ secrets.EMAIL_TO }}
+          EMAIL_CC:            ${{ secrets.EMAIL_CC }}
 
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
 
       - name: Send daily email report
-        if: always()   # send even if scraper had partial failures
-        run: python send_daily_email.py --now
+        if: always()
+        run: python send_daily_email.py
 
       - name: Upload artifacts
         if: always()

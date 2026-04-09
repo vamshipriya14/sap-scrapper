@@ -14,13 +14,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Keep workflow alive
-        run: |
-          git config user.email "actions@github.com"
-          git config user.name "GitHub Actions"
-          git commit --allow-empty -m "chore: keep workflow active [skip ci]"
-          git push
-
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:

@@ -12,6 +12,7 @@ Required secrets / .env:
 """
 
 import os
+import json
 import io
 import base64
 import logging
@@ -121,7 +122,7 @@ def fetch_active_jobs() -> list:
         supabase.table("jr_master")
         .select(", ".join(COLUMNS_FROM_DB))
         .gte("posting_end_date", today_iso)
-        .order("jr_no", desc=False)
+        .order("posting_start_date", desc=True)
         .limit(5000)
         .execute()
     )
@@ -180,43 +181,51 @@ def reset_new_jr_to_active() -> None:
         logging.error(f"reset_new_jr_to_active failed: {e}")
 
 
-def fetch_highlights() -> dict:
-    """Fetch new jr rows and today's deactivated rows for the email highlights table."""
-    today_start = date.today().isoformat() + "T00:00:00"
+HANDOFF_FILE = "scraper_handoff.json"
+
+
+def _load_handoff() -> dict:
+    """Read the JSON file written by the scraper. Returns empty lists if missing."""
+    try:
+        with open(HANDOFF_FILE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        logging.warning(f"Handoff file '{HANDOFF_FILE}' not found — highlights will be empty")
+        return {"new_jr_nos": [], "deactivated_jr_nos": []}
+    except Exception as e:
+        logging.warning(f"Could not read handoff file: {e}")
+        return {"new_jr_nos": [], "deactivated_jr_nos": []}
+
+
+def _fetch_rows_by_jr_nos(jr_nos: list) -> list:
+    """Fetch jr_no, skill_name, client_recruiter, jr_status for a list of jr_nos."""
+    if not jr_nos:
+        return []
     cols = "jr_no, skill_name, client_recruiter, jr_status"
     try:
-        new_resp = (
+        resp = (
             supabase.table("jr_master")
             .select(cols)
-            .eq("jr_status", "new jr")
+            .in_("jr_no", jr_nos)
             .order("jr_no")
             .execute()
         )
-        new_rows = new_resp.data or []
+        return resp.data or []
     except Exception as e:
-        logging.warning(f"fetch_highlights new_jr failed: {e}")
-        new_rows = []
+        logging.warning(f"_fetch_rows_by_jr_nos failed: {e}")
+        return []
 
-    try:
-        deact_resp = (
-            supabase.table("jr_master")
-            .select(cols)
-            .eq("jr_status", "inactive")
-            .gte("modified_date", today_start)
-            .order("jr_no")
-            .execute()
-        )
-        deact_rows = deact_resp.data or []
-    except Exception as e:
-        logging.warning(f"fetch_highlights deactivated failed: {e}")
-        deact_rows = []
 
+def fetch_highlights() -> dict:
+    """Use the scraper handoff file to fetch exactly the new/deactivated rows."""
+    handoff    = _load_handoff()
+    new_rows   = _fetch_rows_by_jr_nos(handoff["new_jr_nos"])
+    deact_rows = _fetch_rows_by_jr_nos(handoff["deactivated_jr_nos"])
     return {"new_jr": new_rows, "deactivated": deact_rows}
 
 
-def fetch_summary_counts() -> dict:
-    """Fetch total active and new jr counts for the summary cards."""
-    today_start = date.today().isoformat() + "T00:00:00"
+def fetch_summary_counts(highlights: dict) -> dict:
+    """Derive deactivated count from handoff; query DB for active + new jr counts."""
     try:
         active_resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
         active_count = len(active_resp.data or [])
@@ -231,18 +240,8 @@ def fetch_summary_counts() -> dict:
         logging.warning(f"fetch_summary new jr count failed: {e}")
         new_count = 0
 
-    try:
-        deact_resp = (
-            supabase.table("jr_master")
-            .select("jr_no")
-            .eq("jr_status", "inactive")
-            .gte("modified_date", today_start)
-            .execute()
-        )
-        deact_count = len(deact_resp.data or [])
-    except Exception as e:
-        logging.warning(f"fetch_summary deactivated count failed: {e}")
-        deact_count = 0
+    # Deactivated count comes from the handoff — exact, no modified_date ambiguity
+    deact_count = len(highlights.get("deactivated", []))
 
     return {"active": active_count, "new_jr": new_count, "deactivated": deact_count}
 
@@ -464,8 +463,8 @@ def send_email():
 
     # 1. Fetch data
     records    = fetch_active_jobs()
-    summary    = fetch_summary_counts()
     highlights = fetch_highlights()
+    summary    = fetch_summary_counts(highlights)
     logging.info(
         f"Records: {len(records)} | Active: {summary['active']} | "
         f"New JR: {summary['new_jr']} | Deactivated today: {summary['deactivated']}"

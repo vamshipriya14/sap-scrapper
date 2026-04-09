@@ -778,7 +778,7 @@ class SAPJobListingsScraper:
                     jr_status     = existing_status
                     modified_date = existing_rec.get("modified_date") or now_iso
 
-                formatted.append({
+                record = {
                     "jr_no":               req_id,
                     "skill_name":          self.clean_text(row.get("job_title")),
                     "posting_start_date":  self.parse_date(row.get("posting_start_date")),
@@ -789,7 +789,12 @@ class SAPJobListingsScraper:
                     "company_name":        "BS",
                     "jr_status":           jr_status,
                     "modified_date":       modified_date,
-                })
+                    "modified_by":         "TalentAxis",
+                }
+                if existing_rec is None:
+                    # New record — set created_by once
+                    record["created_by"] = "TalentAxis"
+                formatted.append(record)
 
             if not formatted:
                 continue

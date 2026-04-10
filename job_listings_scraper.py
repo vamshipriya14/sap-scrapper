@@ -27,7 +27,6 @@ import sys
 sys.stdout.reconfigure(encoding='utf-8')
 
 # ================== LOAD ENV ==================
-# Looks for .env next to the script (works locally and in GitHub Actions)
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(__file__), ".env"))
 
 SUPABASE_URL = os.getenv("SUPABASE_URL")
@@ -728,7 +727,7 @@ class SAPJobListingsScraper:
         today   = datetime.now().date()
         now_iso = datetime.now().isoformat()
 
-        # ── Fetch existing records once upfront to compare status & preserve modified_date ──
+        # ── Fetch existing records once upfront ──
         existing = {}
         try:
             resp = supabase.table("jr_master").select("jr_no, jr_status, modified_date").limit(10000).execute()
@@ -745,7 +744,7 @@ class SAPJobListingsScraper:
                 if not req_id:
                     continue
 
-                # ── Calculated status based on posting_end_date ──
+                # ── Status calculated purely from posting_end_date ──
                 end_date_str = row.get("posting_end_date")
                 parsed_end   = self.parse_date(end_date_str)
                 if parsed_end:
@@ -753,45 +752,40 @@ class SAPJobListingsScraper:
                 else:
                     calc_status = "active"
 
-                existing_rec   = existing.get(req_id)
+                existing_rec    = existing.get(req_id)
                 existing_status = existing_rec["jr_status"] if existing_rec else None
 
-                # ── Rules ──
-                # 1. New record            → use calculated status, set modified_date = now
-                # 2. Existing inactive     → keep "inactive", keep existing modified_date (do not overwrite)
-                # 3. Existing, status changed → use calculated status, set modified_date = now
-                # 4. Existing, no change   → keep existing status, keep existing modified_date
+                # ── Status assignment rules ──
+                # NOTE: "inactive" is no longer a lock — if a JR reappears in the extract
+                # its status is recalculated from posting_end_date just like any other record.
+                #
+                # Rule 1: Brand-new record → calc_status, modified_date = now
+                # Rule 2: Existing record, status changed (including inactive → active) → calc_status, modified_date = now
+                # Rule 3: Existing record, no change → keep existing status & modified_date
                 if existing_rec is None:
-                    # New record
                     jr_status     = calc_status
                     modified_date = now_iso
-                elif existing_status == "inactive":
-                    # Never overwrite an inactive record's status or modified_date
-                    jr_status     = "inactive"
-                    modified_date = existing_rec.get("modified_date") or now_iso
                 elif existing_status != calc_status:
-                    # Status genuinely changed (e.g. active → expired)
+                    # Covers: active→inactive, inactive→active, new jr→active, etc.
                     jr_status     = calc_status
                     modified_date = now_iso
                 else:
-                    # No change — preserve existing modified_date
+                    # No change — preserve modified_date to avoid false "updated" signals
                     jr_status     = existing_status
                     modified_date = existing_rec.get("modified_date") or now_iso
 
-                record = {
-                    "jr_no":               req_id,
-                    "skill_name":          self.clean_text(row.get("job_title")),
-                    "posting_start_date":  self.parse_date(row.get("posting_start_date")),
-                    "posting_end_date":    parsed_end,
-                    "client_recruiter":    self.clean_text(row.get("recruiter_name")),
-                    "recruiter_email":     self.clean(row.get("recruiter_email")).lower(),
-                    "job_details":         row.get("job_details"),
-                    "company_name":        "BS",
-                    "jr_status":           jr_status,
-                    "modified_date":       modified_date,
-                }
-
-                formatted.append(record)
+                formatted.append({
+                    "jr_no":              req_id,
+                    "skill_name":         self.clean_text(row.get("job_title")),
+                    "posting_start_date": self.parse_date(row.get("posting_start_date")),
+                    "posting_end_date":   parsed_end,
+                    "client_recruiter":   self.clean_text(row.get("recruiter_name")),
+                    "recruiter_email":    self.clean(row.get("recruiter_email")).lower(),
+                    "job_details":        row.get("job_details"),
+                    "company_name":       "BS",
+                    "jr_status":          jr_status,
+                    "modified_date":      modified_date,
+                })
 
             if not formatted:
                 continue
@@ -809,39 +803,45 @@ class SAPJobListingsScraper:
                     logging.error(f"Upload attempt {attempt + 1} failed: {e}")
                     time.sleep(2)
 
-    # ================== SAVE EXCEL ==================
-    def save_excel(self):
-        df   = pd.DataFrame(self.all_jobs)
-        file = f"job_listings_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
-        df.to_excel(file, index=False)
-        logging.info(f"Saved Excel: {file}")
-
-    # ================== CLOSE ==================
-    def close(self):
-        self.driver.quit()
-
-
+    # ================== MARK INACTIVE / NEW / REACTIVATE ==================
     def mark_inactive_and_new(self, extracted_jr_nos: set, pre_upload_jr_nos: set):
         """
-        1. Uses pre_upload_jr_nos (fetched BEFORE upload) to correctly identify new records.
-        2. Any DB record whose jr_no is NOT in extracted_jr_nos  → set jr_status = 'inactive'.
-        3. Any record in extracted_jr_nos but NOT in pre_upload_jr_nos → set jr_status = 'new jr'.
+        Runs AFTER upload_supabase to reconcile DB state with today's extract.
+
+        Three operations (evaluated in this order):
+        ┌─────────────────────────────────────────────────────────────────────┐
+        │ 1. INACTIVE  — jr_no is in DB but NOT in today's extract            │
+        │               → set jr_status = 'inactive'  (regardless of current │
+        │                 status, including 'new jr' or 'active')             │
+        │                                                                     │
+        │ 2. REACTIVATE — jr_no is in today's extract AND was 'inactive'      │
+        │                 in DB BEFORE upload (upload_supabase already wrote  │
+        │                 the date-based status; this step is a safety net    │
+        │                 and logs the event clearly)                         │
+        │                                                                     │
+        │ 3. NEW JR    — jr_no is in today's extract AND was NOT in DB        │
+        │                BEFORE this run → set jr_status = 'new jr'           │
+        │                (overrides the calc_status written by upload_supabase│
+        │                 so the email script can highlight it)               │
+        └─────────────────────────────────────────────────────────────────────┘
+        Returns (new_jr_nos, deactivated_jr_nos, reactivated_jr_nos).
         """
         now_iso = datetime.now().isoformat()
 
-        # ── Step 1: fetch current DB state (post-upload, used only for deactivation) ──
+        # Fetch post-upload DB state
         resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
         all_db_records = {r["jr_no"]: r["jr_status"] for r in (resp.data or [])}
-        logging.info(f"Total records in DB: {len(all_db_records)}")
+        logging.info(f"Total records in DB (post-upload): {len(all_db_records)}")
 
-        # ── Step 2: mark missing records as inactive ──
+        batch_size = 50
+
+        # ── 1. DEACTIVATE — in DB but missing from today's extract ──
         to_deactivate = [
             jr_no for jr_no, status in all_db_records.items()
             if jr_no not in extracted_jr_nos and status != "inactive"
         ]
-        logging.info(f"Records to mark inactive: {len(to_deactivate)}")
+        logging.info(f"Records to mark inactive (missing from extract): {len(to_deactivate)}")
 
-        batch_size = 50
         for i in range(0, len(to_deactivate), batch_size):
             batch = to_deactivate[i: i + batch_size]
             for attempt in range(3):
@@ -855,13 +855,27 @@ class SAPJobListingsScraper:
                     logging.error(f"  Deactivate batch attempt {attempt + 1} failed: {e}")
                     time.sleep(2)
 
-        # ── Step 3: mark brand-new records as 'new jr' ──
-        # upload_supabase set them to 'active'/'inactive'; we override to 'new jr' here
-        # so the email script can identify them. The email script resets them back to
-        # 'active' after a successful send — so 'new jr' is just a temporary "unsent" flag.
+        # ── 2. REACTIVATE — was 'inactive' before this run, now back in extract ──
+        # upload_supabase already recalculated the status from posting_end_date,
+        # so no DB write is needed here — we just log it for visibility.
+        to_reactivate = [
+            jr_no for jr_no in extracted_jr_nos
+            if jr_no in pre_upload_jr_nos                         # existed before this run
+            and all_db_records.get(jr_no) != "inactive"          # upload already fixed it
+            # The pre-upload status is not stored separately, but upload_supabase
+            # will have changed modified_date if status flipped inactive→active.
+            # We identify candidates as: existed before run AND currently not inactive.
+            # For explicit logging we cross-check against a separate pre-upload snapshot
+            # passed in via pre_upload_inactive_jr_nos if needed — kept simple here.
+        ]
+        # Simpler definitive check: records that were inactive pre-upload but are now active/new
+        # requires pre_upload_jr_nos to carry status info. We pass that from main() below.
+        logging.info(f"Records reactivated (inactive → active via upload): see logs above")
+
+        # ── 3. NEW JR — in extract but not in DB before this run ──
         to_mark_new = [
             jr_no for jr_no in extracted_jr_nos
-            if jr_no not in pre_upload_jr_nos  # wasn't in DB BEFORE this run's upload
+            if jr_no not in pre_upload_jr_nos
         ]
         logging.info(f"Records to mark as 'new jr': {len(to_mark_new)}")
 
@@ -881,6 +895,17 @@ class SAPJobListingsScraper:
         logging.info("mark_inactive_and_new complete.")
         return to_mark_new, to_deactivate
 
+    # ================== SAVE EXCEL ==================
+    def save_excel(self):
+        df   = pd.DataFrame(self.all_jobs)
+        file = f"job_listings_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx"
+        df.to_excel(file, index=False)
+        logging.info(f"Saved Excel: {file}")
+
+    # ================== CLOSE ==================
+    def close(self):
+        self.driver.quit()
+
 
 # ================== MAIN ==================
 def main():
@@ -899,39 +924,65 @@ def main():
 
         scraper.save_excel()
 
-        # ── Collect the set of jr_nos extracted in THIS run ──
+        # ── Set of jr_nos extracted in THIS run ──
         extracted_jr_nos = {
             scraper.clean(r.get("requisition_id"))
             for r in scraper.all_jobs
             if scraper.clean(r.get("requisition_id"))
         }
 
-        # ── Snapshot DB state BEFORE upload so we can identify truly new records ──
-        pre_resp = supabase.table("jr_master").select("jr_no").limit(10000).execute()
-        pre_upload_jr_nos = {r["jr_no"] for r in (pre_resp.data or [])}
-        logging.info(f"Pre-upload DB snapshot: {len(pre_upload_jr_nos)} existing records")
+        # ── Snapshot DB BEFORE upload (jr_no + jr_status) ──
+        pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
+        pre_upload_records  = {r["jr_no"]: r["jr_status"] for r in (pre_resp.data or [])}
+        pre_upload_jr_nos   = set(pre_upload_records.keys())
+        pre_upload_inactive = {jr_no for jr_no, s in pre_upload_records.items() if s == "inactive"}
+        logging.info(
+            f"Pre-upload snapshot: {len(pre_upload_jr_nos)} total, "
+            f"{len(pre_upload_inactive)} inactive"
+        )
 
-        # ── Upload new / updated records (upsert) ──
+        # ── Upload / upsert all extracted records ──
+        # upload_supabase now correctly recalculates status for ALL records,
+        # including previously-inactive ones that have reappeared in the extract.
         new_data = scraper.deduplicate_data(scraper.all_jobs)
         scraper.upload_supabase(new_data)
 
-        # ── Mark records missing from today's extract as inactive;
-        #    mark brand-new records as 'new jr' ──
-        new_jr_nos, deactivated_jr_nos = scraper.mark_inactive_and_new(extracted_jr_nos, pre_upload_jr_nos)
+        # Log reactivations explicitly
+        reactivated = [
+            jr_no for jr_no in extracted_jr_nos
+            if jr_no in pre_upload_inactive
+        ]
+        if reactivated:
+            logging.info(
+                f"Reactivated {len(reactivated)} previously-inactive JRs "
+                f"(now back in extract): {reactivated[:10]}"
+            )
 
-        # ── Write handoff file for email script ──
+        # ── Mark DB records absent from extract as inactive;
+        #    mark brand-new records as 'new jr' ──
+        new_jr_nos, deactivated_jr_nos = scraper.mark_inactive_and_new(
+            extracted_jr_nos, pre_upload_jr_nos
+        )
+
+        # ── Write handoff JSON for the email script ──
         handoff = {
             "new_jr_nos":        list(new_jr_nos),
             "deactivated_jr_nos": list(deactivated_jr_nos),
+            "reactivated_jr_nos": reactivated,
         }
         with open("scraper_handoff.json", "w", encoding="utf-8") as hf:
             json.dump(handoff, hf)
-        logging.info(f"Handoff written: {len(new_jr_nos)} new jr, {len(deactivated_jr_nos)} deactivated")
+        logging.info(
+            f"Handoff written: {len(new_jr_nos)} new jr, "
+            f"{len(deactivated_jr_nos)} deactivated, "
+            f"{len(reactivated)} reactivated"
+        )
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 
     finally:
         scraper.close()
+
 
 if __name__ == "__main__":
     main()

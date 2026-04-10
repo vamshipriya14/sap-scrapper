@@ -789,11 +789,8 @@ class SAPJobListingsScraper:
                     "company_name":        "BS",
                     "jr_status":           jr_status,
                     "modified_date":       modified_date,
-                    "modified_by":         "TalentAxis",
                 }
-                if existing_rec is None:
-                    # New record — set created_by once
-                    record["created_by"] = "TalentAxis"
+
                 formatted.append(record)
 
             if not formatted:

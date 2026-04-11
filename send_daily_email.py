@@ -101,7 +101,6 @@ COLUMNS_FROM_DB = [
     "jr_status",
 ]
 
-
 DISPLAY_HEADERS = {
     "jr_no":               "JR No",
     "skill_name":          "Job Title",
@@ -198,10 +197,12 @@ def _load_handoff() -> dict:
 
 
 def _fetch_rows_by_jr_nos(jr_nos: list) -> list:
-    """Fetch jr_no, skill_name, client_recruiter, jr_status for a list of jr_nos."""
+    """Fetch jr_no, skill_name, posting_start_date, client_recruiter, jr_status
+    for a given list of jr_nos. posting_start_date is needed for the Assign Date column.
+    """
     if not jr_nos:
         return []
-    cols = "jr_no, skill_name, client_recruiter, jr_status"
+    cols = "jr_no, skill_name, posting_start_date, client_recruiter, jr_status"
     try:
         resp = (
             supabase.table("jr_master")
@@ -227,14 +228,14 @@ def fetch_highlights() -> dict:
 def fetch_summary_counts(highlights: dict) -> dict:
     """Derive deactivated count from handoff; query DB for active + new jr counts."""
     try:
-        active_resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
+        active_resp  = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
         active_count = len(active_resp.data or [])
     except Exception as e:
         logging.warning(f"fetch_summary active count failed: {e}")
         active_count = 0
 
     try:
-        new_resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "new jr").execute()
+        new_resp  = supabase.table("jr_master").select("jr_no").eq("jr_status", "new jr").execute()
         new_count = len(new_resp.data or [])
     except Exception as e:
         logging.warning(f"fetch_summary new jr count failed: {e}")
@@ -324,50 +325,112 @@ def build_excel(records: list) -> bytes:
 
 
 # ─────────────────────────────────────────────
-# HTML BODY
+# HTML BODY HELPERS
 # ─────────────────────────────────────────────
+
+# Compact badge labels shown in the email table
+# "D" = Deactivated Today  |  "A" = Active  |  "New" = New JR
+_STATUS_BADGE = {
+    "new jr":   ("New JR",         "#00B050"),
+    "active":   ("Active",         "#0070C0"),
+    "inactive": ("D",              "#C00000"),  # compact — "D" = Deactivated Today
+}
+
+
+def _fmt_date(val) -> str:
+    """Format an ISO date string (or None) to DD-Mon-YY. Returns '' if blank."""
+    if not val:
+        return ""
+    try:
+        return datetime.fromisoformat(str(val)).strftime("%d-%b-%y")
+    except Exception:
+        return str(val)
+
+
 def _highlights_table_html(rows: list, status: str) -> str:
-    """Build an HTML table for new jr or deactivated rows."""
+    """Build a compact HTML highlight table for new jr or deactivated rows.
+
+    Columns: JR No | Job Title | JR Assign Date | Recruiter | St
+    ─────────────────────────────────────────────────────────────
+    Changes vs original:
+      • Added 'JR Assign Date' column (posting_start_date, DD-Mon-YY format)
+      • Status badge shrunk to 'D' / 'A' / 'New' instead of full label text
+      • Header & badge colour driven by _STATUS_BADGE lookup
+    """
     if not rows:
         return ""
-    color   = "#00B050" if status == "new jr" else "#CC0000"
-    label   = "New JR" if status == "new jr" else "Deactivated Today"
-    bg      = "#f0fff4" if status == "new jr" else "#fff5f5"
+
+    badge_label, hdr_color = _STATUS_BADGE.get(status, ("?", "#888888"))
+    section_title = "New JR" if status == "new jr" else "Deactivated Today"
+    row_bg        = "#f0fff4" if status == "new jr" else "#fff5f5"
+
     rows_html = ""
-    for r in rows:
-        recruiter = r.get("client_recruiter") or "—"
+    for i, r in enumerate(rows):
+        bg          = row_bg if i % 2 == 0 else "#ffffff"
+        recruiter   = r.get("client_recruiter") or "—"
+        assign_date = _fmt_date(r.get("posting_start_date"))
+
         rows_html += (
-            f"<tr>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{r.get('jr_no','')}</td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{r.get('skill_name','')}</td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;'>{recruiter}</td>"
-            f"<td style='padding:6px 10px;border-bottom:1px solid #eee;font-size:12.5px;text-align:center;'>"
-            f"<span style='background:{color};color:#fff;border-radius:10px;padding:2px 10px;font-size:11.5px;font-weight:700;'>{label}</span>"
+            f"<tr style='background:{bg};'>"
+            # JR No
+            f"<td style='padding:5px 8px;border-bottom:1px solid #e8e8e8;"
+            f"font-size:12px;white-space:nowrap;'>{r.get('jr_no', '')}</td>"
+            # Job Title — truncate long strings via title tooltip
+            f"<td style='padding:5px 8px;border-bottom:1px solid #e8e8e8;"
+            f"font-size:12px;max-width:160px;overflow:hidden;"
+            f"text-overflow:ellipsis;white-space:nowrap;' "
+            f"title='{r.get('skill_name', '')}'>{r.get('skill_name', '')}</td>"
+            # JR Assign Date (posting_start_date)
+            f"<td style='padding:5px 8px;border-bottom:1px solid #e8e8e8;"
+            f"font-size:12px;white-space:nowrap;text-align:center;'>{assign_date}</td>"
+            # Recruiter — truncate
+            f"<td style='padding:5px 8px;border-bottom:1px solid #e8e8e8;"
+            f"font-size:12px;max-width:120px;overflow:hidden;"
+            f"text-overflow:ellipsis;white-space:nowrap;' "
+            f"title='{recruiter}'>{recruiter}</td>"
+            # Status badge — compact single-letter / short label
+            f"<td style='padding:5px 8px;border-bottom:1px solid #e8e8e8;"
+            f"text-align:center;'>"
+            f"<span style='background:{hdr_color};color:#fff;border-radius:9px;"
+            f"padding:2px 9px;font-size:11px;font-weight:700;'>{badge_label}</span>"
             f"</td>"
             f"</tr>"
         )
+
     return f"""
-<p style="margin:18px 0 6px;font-size:13.5px;font-weight:600;color:#333;">{label} — {len(rows)} record(s)</p>
-<table style="width:100%;border-collapse:collapse;background:{bg};border-radius:6px;overflow:hidden;font-family:'Segoe UI',Arial,sans-serif;">
+<p style="margin:18px 0 5px;font-size:13px;font-weight:600;color:#333;">
+  {section_title} &mdash; {len(rows)} record(s)
+</p>
+<table style="width:100%;border-collapse:collapse;font-family:'Segoe UI',Arial,sans-serif;
+              border-radius:6px;overflow:hidden;">
   <thead>
-    <tr style="background:{color};">
-      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">JR No</th>
-      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">Job Title</th>
-      <th style="padding:8px 10px;text-align:left;color:#fff;font-size:12px;font-weight:600;">Recruiter</th>
-      <th style="padding:8px 10px;text-align:center;color:#fff;font-size:12px;font-weight:600;">Status</th>
+    <tr style="background:{hdr_color};">
+      <th style="padding:6px 8px;text-align:left;color:#fff;font-size:11.5px;
+                 font-weight:600;white-space:nowrap;">JR No</th>
+      <th style="padding:6px 8px;text-align:left;color:#fff;font-size:11.5px;
+                 font-weight:600;">Job Title</th>
+      <th style="padding:6px 8px;text-align:center;color:#fff;font-size:11.5px;
+                 font-weight:600;white-space:nowrap;">JR Assign Date</th>
+      <th style="padding:6px 8px;text-align:left;color:#fff;font-size:11.5px;
+                 font-weight:600;">Recruiter</th>
+      <th style="padding:6px 8px;text-align:center;color:#fff;font-size:11.5px;
+                 font-weight:600;">St</th>
     </tr>
   </thead>
   <tbody>{rows_html}</tbody>
 </table>"""
 
 
+# ─────────────────────────────────────────────
+# HTML BODY
+# ─────────────────────────────────────────────
 def build_html_body(summary: dict, highlights: dict) -> str:
-    today_str   = datetime.now().strftime("%B %d, %Y")
-    active_cnt  = summary.get("active", 0)
-    new_cnt     = summary.get("new_jr", 0)
-    deact_cnt   = summary.get("deactivated", 0)
+    today_str  = datetime.now().strftime("%B %d, %Y")
+    active_cnt = summary.get("active", 0)
+    new_cnt    = summary.get("new_jr", 0)
+    deact_cnt  = summary.get("deactivated", 0)
 
-    new_table   = _highlights_table_html(highlights.get("new_jr", []),    "new jr")
+    new_table   = _highlights_table_html(highlights.get("new_jr", []),     "new jr")
     deact_table = _highlights_table_html(highlights.get("deactivated", []), "inactive")
 
     return f"""<!DOCTYPE html>
@@ -401,7 +464,7 @@ def build_html_body(summary: dict, highlights: dict) -> str:
     .dot {{ width:12px; height:12px; border-radius:50%; display:inline-block; }}
     .dot-new      {{ background:#00B050; }}
     .dot-active   {{ background:#0070C0; }}
-    .dot-inactive {{ background:#FF0000; }}
+    .dot-inactive {{ background:#C00000; }}
     .footer {{ background:#f0f4f8; padding:16px 30px; border-top:1px solid #dde4ee;
                font-size:12.5px; color:#666; }}
     .footer strong {{ color:#1F4E79; font-size:13.5px; }}
@@ -438,9 +501,9 @@ def build_html_body(summary: dict, highlights: dict) -> str:
 
     <p style="margin-top:20px;"><strong>Excel Status Legend:</strong></p>
     <div class="legend">
-      <span class="legend-item"><span class="dot dot-new"></span> New JR &ndash; Newly added posting</span>
-      <span class="legend-item"><span class="dot dot-active"></span> Active &ndash; Posting end date in future</span>
-      <span class="legend-item"><span class="dot dot-inactive"></span> Inactive &ndash; Expired / not in latest extract</span>
+      <span class="legend-item"><span class="dot dot-new"></span> <strong>New JR</strong> &ndash; Newly added posting</span>
+      <span class="legend-item"><span class="dot dot-active"></span> <strong>Active</strong> &ndash; Posting end date in future</span>
+      <span class="legend-item"><span class="dot dot-inactive"></span> <strong>D</strong> &ndash; Deactivated today</span>
     </div>
     <p>For full job details and requirements, please refer to the
        <a href="https://hr-data-ui-volibits.streamlit.app/#job-requirements" style="color:#1F4E79;font-weight:600;">ATS Portal</a>.</p>
@@ -474,7 +537,7 @@ def send_email():
     excel_bytes = build_excel(records)
     excel_name  = f"job_listings_{datetime.now().strftime('%Y%m%d')}.xlsx"
     excel_b64   = base64.b64encode(excel_bytes).decode("utf-8")
-    logging.info(f"Excel built: {len(excel_bytes):,} bytes → {excel_name}")
+    logging.info(f"Excel built: {len(excel_bytes):,} bytes -> {excel_name}")
 
     # 3. Subject  e.g. "JR Data for BS - 08 Apr 2026"
     subject = f"JR Data for BS - {datetime.now().strftime('%d %b %Y')}"
@@ -514,13 +577,13 @@ def send_email():
         try:
             resp = requests.post(url, headers=headers, json=payload, timeout=60)
             if resp.status_code == 202:
-                logging.info(f"✅ Email sent | Subject: '{subject}'")
+                logging.info(f"Email sent | Subject: '{subject}'")
                 logging.info(f"   To: {EMAIL_TO}" + (f" | CC: {EMAIL_CC}" if EMAIL_CC else ""))
-                # Reset 'new jr' → 'active' ONLY after confirmed send
+                # Reset 'new jr' -> 'active' ONLY after confirmed send
                 reset_new_jr_to_active()
                 break
             else:
-                logging.error(f"Attempt {attempt+1}: {resp.status_code} — {resp.text}")
+                logging.error(f"Attempt {attempt+1}: {resp.status_code} - {resp.text}")
                 if attempt < 2:
                     time.sleep(5)
         except Exception as e:

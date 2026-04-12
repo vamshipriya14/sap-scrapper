@@ -2,7 +2,7 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # 8:00 AM IST (UTC+5:30 → subtract 5:30 → 2:30 AM UTC)
+    - cron: '30 2 * * *'   # 8:00 AM IST = 02:30 UTC (5:30 AM offset from UTC)
   workflow_dispatch:
 
 jobs:
@@ -88,11 +88,14 @@ jobs:
           EMAIL_TO:            ${{ secrets.EMAIL_TO }}
           EMAIL_CC:            ${{ secrets.EMAIL_CC }}
 
+      - name: Log workflow trigger event
+        run: echo "Triggered by: ${{ github.event_name }} | Actor: ${{ github.actor }} | Time: $(date -u)"
+
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
 
       - name: Send daily email report
-        if: always()
+        if: github.event_name == 'schedule'
         run: python send_daily_email.py
 
       - name: Upload artifacts

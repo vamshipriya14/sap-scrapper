@@ -2,8 +2,17 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # 8:00 AM IST = 02:30 UTC (5:30 AM offset from UTC)
+    - cron: '30 2 * * *'   # 8:00 AM IST
   workflow_dispatch:
+    inputs:
+      send_email:
+        description: 'Send email report after scraping?'
+        required: false
+        default: 'true'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
 
 jobs:
   scrape:
@@ -35,8 +44,6 @@ jobs:
             "azure-identity==1.17.1" \
             "msgraph-sdk==1.5.4" \
             "requests>=2.31.0"
-          echo "--- Installed versions ---"
-          pip show supabase gotrue httpx websockets requests | grep -E "Name|Version"
 
       - name: Install Chrome
         run: |
@@ -95,8 +102,11 @@ jobs:
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
 
+      # ✅ FIX: Always send email — for schedule AND manual triggers
       - name: Send daily email report
-        if: github.event_name == 'schedule'
+        if: |
+          github.event_name == 'schedule' ||
+          (github.event_name == 'workflow_dispatch' && github.event.inputs.send_email == 'true')
         run: python send_daily_email.py
 
       - name: Upload artifacts

@@ -89,7 +89,8 @@ jobs:
           EMAIL_CC:            ${{ secrets.EMAIL_CC }}
 
       - name: Log workflow trigger event
-        run: echo "Triggered by: ${{ github.event_name }} | Actor: ${{ github.actor }} | Time: $(date -u)"
+        run: |
+          echo "Triggered by: ${{ github.event_name }} | Actor: ${{ github.actor }} | Time: $(date -u)"
 
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py

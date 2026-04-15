@@ -2,7 +2,7 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '30 2 * * *'   # 8:00 AM IST
+    - cron: '30 0 * * *'   # 8:00 AM IST
   workflow_dispatch:
     inputs:
       send_email:

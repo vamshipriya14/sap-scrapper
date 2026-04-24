@@ -317,7 +317,7 @@ class SAPCDPScraper:
         logging.info("Extracting all loaded candidates...")
 
         candidates = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMCLI")
-        limit = min(100, len(candidates))
+        limit = min(500, len(candidates))
 
         logging.info(f"Processing {limit} candidates...")
 
@@ -507,7 +507,7 @@ class SAPCDPScraper:
     def get_existing_keys(self):
         response = supabase.table("candidates") \
             .select("email, phone, jr_no") \
-            .limit(1000) \
+            .limit(10000) \
             .execute()
 
         existing = set()

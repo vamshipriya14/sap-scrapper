@@ -503,6 +503,7 @@ class SAPCDPScraper:
             logging.info("✓ All retries successful!")
 
     # ================== FILTER ==================
+    # FIX 1: Query jr_no instead of non-existent requisition_id column
     def get_existing_keys(self):
         response = supabase.table("candidates") \
             .select("email, phone, jr_no") \
@@ -582,9 +583,10 @@ class SAPCDPScraper:
 
             for attempt in range(3):
                 try:
+                    # FIX 2: Use jr_no (actual column name) not requisition_id
                     supabase.table("candidates").upsert(
                         formatted,
-                        on_conflict="email,phone,requisition_id",
+                        on_conflict="email,phone,jr_no",
                         ignore_duplicates=True
                     ).execute()
                     print(f"Inserted {len(formatted)}")

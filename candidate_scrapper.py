@@ -505,7 +505,7 @@ class SAPCDPScraper:
     # ================== FILTER ==================
     def get_existing_keys(self):
         response = supabase.table("candidates") \
-            .select("email, phone, requisition_id") \
+            .select("email, phone, jr_no") \
             .limit(10000) \
             .execute()
 
@@ -514,7 +514,7 @@ class SAPCDPScraper:
             key = (
                 row.get("email") or "",
                 row.get("phone") or "",
-                row.get("requisition_id") or ""
+                row.get("jr_no") or ""
             )
             existing.add(key)
 

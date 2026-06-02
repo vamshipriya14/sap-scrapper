@@ -36,6 +36,9 @@ AZURE_CLIENT_SECRET = os.getenv("AZURE_CLIENT_SECRET")
 EMAIL_FROM          = os.getenv("EMAIL_FROM")
 EMAIL_TO            = os.getenv("EMAIL_TO", "")
 EMAIL_CC            = os.getenv("EMAIL_CC", "")
+REPORT_LOOKBACK_HOURS = int(os.getenv("REPORT_LOOKBACK_HOURS", "24"))
+NOTIFICATION_STATE_TABLE = os.getenv("NOTIFICATION_STATE_TABLE", "automation_state")
+NOTIFICATION_STATE_KEY = os.getenv("NOTIFICATION_STATE_KEY", "sap_daily_email_last_sent_at")
 
 for _var, _val in {
     "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
@@ -115,12 +118,13 @@ DISPLAY_HEADERS = {
 
 
 def fetch_active_jobs() -> list:
-    """Pull active + new jr records (posting_end_date >= today, or still flagged new jr)."""
+    """Pull active records with posting_end_date >= today."""
     today_iso = date.today().isoformat()
     resp = (
         supabase.table("jr_master")
         .select(", ".join(COLUMNS_FROM_DB))
         .gte("posting_end_date", today_iso)
+        .neq("jr_status", "inactive")
         .order("posting_start_date", desc=True)
         .limit(5000)
         .execute()
@@ -128,43 +132,68 @@ def fetch_active_jobs() -> list:
     return resp.data or []
 
 
-def count_new_jrs(records: list) -> int:
-    """Count records currently flagged 'new jr' in DB (not yet emailed)."""
-    return sum(1 for r in records if str(r.get("jr_status", "")).strip().lower() == "new jr")
+HANDOFF_FILE = "scraper_handoff.json"
 
 
-def count_yesterday_new_jrs() -> int:
-    """Count records that were marked 'new jr' and emailed yesterday.
-    Since we reset 'new jr' -> 'active' after each send, we use modified_date
-    on the day *before* today to find yesterday's batch.
-    """
-    yesterday_start = (date.today() - timedelta(days=1)).isoformat() + "T00:00:00"
-    yesterday_end   = (date.today() - timedelta(days=1)).isoformat() + "T23:59:59"
+def _fallback_report_start() -> datetime:
+    return datetime.now() - timedelta(hours=REPORT_LOOKBACK_HOURS)
+
+
+def get_last_successful_email_at() -> datetime:
+    """Return the last successful email checkpoint, or a 24h fallback."""
+    fallback = _fallback_report_start()
     try:
         resp = (
-            supabase.table("jr_master")
-            .select("jr_no")
-            .gte("modified_date", yesterday_start)
-            .lte("modified_date", yesterday_end)
-            .eq("jr_status", "active")   # already reset to active after yesterday's email
+            supabase.table(NOTIFICATION_STATE_TABLE)
+            .select("value")
+            .eq("key", NOTIFICATION_STATE_KEY)
+            .limit(1)
             .execute()
         )
-        return len(resp.data or [])
+        rows = resp.data or []
+        if not rows or not rows[0].get("value"):
+            logging.info(
+                f"No notification checkpoint found; using {REPORT_LOOKBACK_HOURS}h fallback"
+            )
+            return fallback
+        return datetime.fromisoformat(str(rows[0]["value"]))
     except Exception as e:
-        logging.warning(f"Could not fetch yesterday count: {e}")
-        return 0
+        logging.warning(
+            f"Could not read notification checkpoint from {NOTIFICATION_STATE_TABLE}: {e}; "
+            f"using {REPORT_LOOKBACK_HOURS}h fallback"
+        )
+        return fallback
 
 
-def reset_new_jr_to_active() -> None:
-    """After a successful email send, flip all 'new jr' records back to 'active'.
-    This clears the flag so the next run only highlights genuinely new records.
-    """
+def save_successful_email_checkpoint(sent_at: datetime) -> None:
+    """Persist the report window end after a successful email send."""
+    sent_at_iso = sent_at.isoformat()
+    payload = {
+        "key": NOTIFICATION_STATE_KEY,
+        "value": sent_at_iso,
+        "updated_at": datetime.now().isoformat(),
+    }
+    try:
+        supabase.table(NOTIFICATION_STATE_TABLE).upsert(
+            payload,
+            on_conflict="key",
+            ignore_duplicates=False,
+        ).execute()
+        logging.info(f"Notification checkpoint saved: {sent_at_iso}")
+    except Exception as e:
+        logging.error(
+            f"Could not save notification checkpoint to {NOTIFICATION_STATE_TABLE}: {e}"
+        )
+        raise
+
+
+def clear_legacy_new_jr_status() -> None:
+    """Clear old status-based new-JR flags left by previous deployments."""
     now_iso = datetime.now().isoformat()
     try:
         resp = supabase.table("jr_master").select("jr_no").eq("jr_status", "new jr").execute()
         jr_nos = [r["jr_no"] for r in (resp.data or [])]
         if not jr_nos:
-            logging.info("reset_new_jr_to_active: nothing to reset")
             return
 
         batch_size = 50
@@ -173,14 +202,9 @@ def reset_new_jr_to_active() -> None:
             supabase.table("jr_master").update(
                 {"jr_status": "active", "modified_date": now_iso}
             ).in_("jr_no", batch).execute()
-            logging.info(f"  Reset to active batch {i // batch_size + 1}: {len(batch)} records")
-
-        logging.info(f"reset_new_jr_to_active: {len(jr_nos)} records reset to 'active'")
+        logging.info(f"Cleared {len(jr_nos)} legacy new-jr status flag(s)")
     except Exception as e:
-        logging.error(f"reset_new_jr_to_active failed: {e}")
-
-
-HANDOFF_FILE = "scraper_handoff.json"
+        logging.warning(f"Could not clear legacy new-jr status flags: {e}")
 
 
 def _load_handoff() -> dict:
@@ -217,16 +241,95 @@ def _fetch_rows_by_jr_nos(jr_nos: list) -> list:
         return []
 
 
-def fetch_highlights() -> dict:
-    """Use the scraper handoff file to fetch exactly the new/deactivated rows."""
-    handoff    = _load_handoff()
-    new_rows   = _fetch_rows_by_jr_nos(handoff["new_jr_nos"])
-    deact_rows = _fetch_rows_by_jr_nos(handoff["deactivated_jr_nos"])
-    return {"new_jr": new_rows, "deactivated": deact_rows}
+def _dedupe_rows(rows: list) -> list:
+    """Return one row per jr_no while preserving first-seen order."""
+    seen = set()
+    deduped = []
+    for row in rows:
+        jr_no = row.get("jr_no")
+        if not jr_no or jr_no in seen:
+            continue
+        seen.add(jr_no)
+        deduped.append(row)
+    return deduped
+
+
+def _fetch_recent_changes(window_start: datetime, window_end: datetime) -> dict:
+    """Fetch accumulated changes detected by hourly scraper runs."""
+    start_iso = window_start.isoformat()
+    end_iso = window_end.isoformat()
+    cols = "jr_no, skill_name, posting_start_date, client_recruiter, jr_status"
+
+    try:
+        new_resp = (
+            supabase.table("jr_master")
+            .select(cols)
+            .gte("created_date", start_iso)
+            .lte("created_date", end_iso)
+            .order("jr_no")
+            .execute()
+        )
+        new_rows = new_resp.data or []
+    except Exception as e:
+        logging.warning(f"Recent new-jr fetch failed: {e}")
+        new_rows = []
+
+    try:
+        legacy_new_resp = (
+            supabase.table("jr_master")
+            .select(cols)
+            .eq("jr_status", "new jr")
+            .order("jr_no")
+            .execute()
+        )
+        legacy_new_rows = legacy_new_resp.data or []
+    except Exception as e:
+        logging.warning(f"Legacy new-jr fetch failed: {e}")
+        legacy_new_rows = []
+
+    try:
+        deact_resp = (
+            supabase.table("jr_master")
+            .select(cols)
+            .eq("jr_status", "inactive")
+            .gte("modified_date", start_iso)
+            .lte("modified_date", end_iso)
+            .order("jr_no")
+            .execute()
+        )
+        deact_rows = deact_resp.data or []
+    except Exception as e:
+        logging.warning(f"Recent deactivated fetch failed: {e}")
+        deact_rows = []
+
+    logging.info(
+        f"Recent DB changes ({start_iso} to {end_iso}): "
+        f"{len(new_rows)} created-date new jr, "
+        f"{len(legacy_new_rows)} legacy new jr, "
+        f"{len(deact_rows)} deactivated"
+    )
+    return {"new_jr": _dedupe_rows(new_rows + legacy_new_rows), "deactivated": deact_rows}
+
+
+def fetch_highlights(window_start: datetime, window_end: datetime) -> dict:
+    """Fetch accumulated hourly scraper changes for the daily notification.
+
+    The handoff file is still merged in for same-run/manual executions, but the
+    DB is the source that survives separate hourly GitHub Actions runs.
+    """
+    recent = _fetch_recent_changes(window_start, window_end)
+    handoff = _load_handoff()
+    handoff_new = _fetch_rows_by_jr_nos(handoff.get("new_jr_nos", []))
+    handoff_deact = _fetch_rows_by_jr_nos(handoff.get("deactivated_jr_nos", []))
+
+    return {
+        "new_jr": _dedupe_rows(recent["new_jr"] + handoff_new),
+        "deactivated": _dedupe_rows(recent["deactivated"] + handoff_deact),
+    }
 
 
 def fetch_summary_counts(highlights: dict) -> dict:
-    """Derive deactivated count from handoff; query DB for active + new jr counts."""
+    """Derive deactivated count from highlights; query DB for active + new jr counts."""
     try:
         active_resp  = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
         active_count = len(active_resp.data or [])
@@ -234,14 +337,7 @@ def fetch_summary_counts(highlights: dict) -> dict:
         logging.warning(f"fetch_summary active count failed: {e}")
         active_count = 0
 
-    try:
-        new_resp  = supabase.table("jr_master").select("jr_no").eq("jr_status", "new jr").execute()
-        new_count = len(new_resp.data or [])
-    except Exception as e:
-        logging.warning(f"fetch_summary new jr count failed: {e}")
-        new_count = 0
-
-    # Deactivated count comes from the handoff — exact, no modified_date ambiguity
+    new_count = len(highlights.get("new_jr", []))
     deact_count = len(highlights.get("deactivated", []))
 
     return {"active": active_count, "new_jr": new_count, "deactivated": deact_count}
@@ -300,7 +396,6 @@ def build_excel(records: list) -> bytes:
             cell.border    = border
 
             if col_key == "jr_status":
-                # DB holds 'new jr' until email is sent, then resets to 'active'
                 cell.fill      = PatternFill("solid", fgColor=STATUS_COLORS.get(status_raw, "808080"))
                 cell.font      = Font(bold=True, color="FFFFFF", size=10)
                 cell.alignment = Alignment(horizontal="center", vertical="center")
@@ -524,9 +619,16 @@ def build_html_body(summary: dict, highlights: dict) -> str:
 def send_email():
     logging.info("=== Starting daily email job ===")
 
+    report_window_start = get_last_successful_email_at()
+    report_window_end = datetime.now()
+    logging.info(
+        f"Report window: {report_window_start.isoformat()} to "
+        f"{report_window_end.isoformat()}"
+    )
+
     # 1. Fetch data
     records    = fetch_active_jobs()
-    highlights = fetch_highlights()
+    highlights = fetch_highlights(report_window_start, report_window_end)
     summary    = fetch_summary_counts(highlights)
     logging.info(
         f"Records: {len(records)} | Active: {summary['active']} | "
@@ -579,8 +681,8 @@ def send_email():
             if resp.status_code == 202:
                 logging.info(f"Email sent | Subject: '{subject}'")
                 logging.info(f"   To: {EMAIL_TO}" + (f" | CC: {EMAIL_CC}" if EMAIL_CC else ""))
-                # Reset 'new jr' -> 'active' ONLY after confirmed send
-                reset_new_jr_to_active()
+                save_successful_email_checkpoint(report_window_end)
+                clear_legacy_new_jr_status()
                 break
             else:
                 logging.error(f"Attempt {attempt+1}: {resp.status_code} - {resp.text}")

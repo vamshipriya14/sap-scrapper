@@ -2,7 +2,8 @@ name: SAP Job Listings Scraper
 
 on:
   schedule:
-    - cron: '30 0 * * *'   # 8:00 AM IST
+    - cron: '0 * * * *'    # Scrape every hour
+    - cron: '30 2 * * *'   # Send daily email at 8:00 AM IST after scraping
   workflow_dispatch:
     inputs:
       send_email:
@@ -102,10 +103,10 @@ jobs:
       - name: Run SAP job listings scraper
         run: python job_listings_scraper.py
 
-      # ✅ FIX: Always send email — for schedule AND manual triggers
+      # Send email only on the daily schedule, or when requested manually.
       - name: Send daily email report
         if: |
-          github.event_name == 'schedule' ||
+          (github.event_name == 'schedule' && github.event.schedule == '30 2 * * *') ||
           (github.event_name == 'workflow_dispatch' && github.event.inputs.send_email == 'true')
         run: python send_daily_email.py
 

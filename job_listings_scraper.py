@@ -730,7 +730,9 @@ class SAPJobListingsScraper:
         # ── Fetch existing records once upfront ──
         existing = {}
         try:
-            resp = supabase.table("jr_master").select("jr_no, jr_status, modified_date").limit(10000).execute()
+            resp = supabase.table("jr_master").select(
+                "jr_no, jr_status, modified_date, created_date"
+            ).limit(10000).execute()
             existing = {r["jr_no"]: r for r in (resp.data or [])}
             logging.info(f"Fetched {len(existing)} existing records for comparison")
         except Exception as e:
@@ -754,19 +756,20 @@ class SAPJobListingsScraper:
 
                 existing_rec    = existing.get(req_id)
                 existing_status = existing_rec["jr_status"] if existing_rec else None
+                created_date    = existing_rec.get("created_date") if existing_rec else now_iso
 
                 # ── Status assignment rules ──
                 # NOTE: "inactive" is no longer a lock — if a JR reappears in the extract
                 # its status is recalculated from posting_end_date just like any other record.
                 #
-                # Rule 1: Brand-new record → calc_status, modified_date = now
+                # Rule 1: Brand-new record → calc_status, created_date = now, modified_date = now
                 # Rule 2: Existing record, status changed (including inactive → active) → calc_status, modified_date = now
                 # Rule 3: Existing record, no change → keep existing status & modified_date
                 if existing_rec is None:
                     jr_status     = calc_status
                     modified_date = now_iso
                 elif existing_status != calc_status:
-                    # Covers: active→inactive, inactive→active, new jr→active, etc.
+                    # Covers active -> inactive, inactive -> active, etc.
                     jr_status     = calc_status
                     modified_date = now_iso
                 else:
@@ -784,6 +787,7 @@ class SAPJobListingsScraper:
                     "job_details":        row.get("job_details"),
                     "company_name":       "BS",
                     "jr_status":          jr_status,
+                    "created_date":        created_date,
                     "modified_date":      modified_date,
                 })
 
@@ -803,7 +807,7 @@ class SAPJobListingsScraper:
                     logging.error(f"Upload attempt {attempt + 1} failed: {e}")
                     time.sleep(2)
 
-    # ================== MARK INACTIVE / NEW / REACTIVATE ==================
+    # ================== MARK INACTIVE / TRACK NEW / REACTIVATE ==================
     def mark_inactive_and_new(self, extracted_jr_nos: set, pre_upload_jr_nos: set):
         """
         Runs AFTER upload_supabase to reconcile DB state with today's extract.
@@ -812,7 +816,7 @@ class SAPJobListingsScraper:
         ┌─────────────────────────────────────────────────────────────────────┐
         │ 1. INACTIVE  — jr_no is in DB but NOT in today's extract            │
         │               → set jr_status = 'inactive'  (regardless of current │
-        │                 status, including 'new jr' or 'active')             │
+        │                 status)                                             │
         │                                                                     │
         │ 2. REACTIVATE — jr_no is in today's extract AND was 'inactive'      │
         │                 in DB BEFORE upload (upload_supabase already wrote  │
@@ -820,9 +824,8 @@ class SAPJobListingsScraper:
         │                 and logs the event clearly)                         │
         │                                                                     │
         │ 3. NEW JR    — jr_no is in today's extract AND was NOT in DB        │
-        │                BEFORE this run → set jr_status = 'new jr'           │
-        │                (overrides the calc_status written by upload_supabase│
-        │                 so the email script can highlight it)               │
+        │                BEFORE this run → return it for the handoff only.    │
+        │                Daily email identifies new JRs by created_date.      │
         └─────────────────────────────────────────────────────────────────────┘
         Returns (new_jr_nos, deactivated_jr_nos, reactivated_jr_nos).
         """
@@ -873,27 +876,14 @@ class SAPJobListingsScraper:
         logging.info(f"Records reactivated (inactive → active via upload): see logs above")
 
         # ── 3. NEW JR — in extract but not in DB before this run ──
-        to_mark_new = [
+        new_jr_nos = [
             jr_no for jr_no in extracted_jr_nos
             if jr_no not in pre_upload_jr_nos
         ]
-        logging.info(f"Records to mark as 'new jr': {len(to_mark_new)}")
-
-        for i in range(0, len(to_mark_new), batch_size):
-            batch = to_mark_new[i: i + batch_size]
-            for attempt in range(3):
-                try:
-                    supabase.table("jr_master").update(
-                        {"jr_status": "new jr", "modified_date": now_iso}
-                    ).in_("jr_no", batch).execute()
-                    logging.info(f"  Marked new jr batch {i // batch_size + 1}: {len(batch)} records")
-                    break
-                except Exception as e:
-                    logging.error(f"  Mark-new batch attempt {attempt + 1} failed: {e}")
-                    time.sleep(2)
+        logging.info(f"New JRs detected by created_date/handoff: {len(new_jr_nos)}")
 
         logging.info("mark_inactive_and_new complete.")
-        return to_mark_new, to_deactivate
+        return new_jr_nos, to_deactivate
 
     # ================== SAVE EXCEL ==================
     def save_excel(self):
@@ -959,7 +949,7 @@ def main():
             )
 
         # ── Mark DB records absent from extract as inactive;
-        #    mark brand-new records as 'new jr' ──
+        #    return brand-new records for the handoff ──
         new_jr_nos, deactivated_jr_nos = scraper.mark_inactive_and_new(
             extracted_jr_nos, pre_upload_jr_nos
         )

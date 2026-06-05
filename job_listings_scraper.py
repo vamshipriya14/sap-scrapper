@@ -133,7 +133,6 @@ class SAPJobListingsScraper:
                 f.write(self.driver.page_source)
             raise
 
-    # ================== SCROLL & LOAD ==================
     def scroll_and_load_all(self, limit=Limit):
         logging.info(f"Loading up to {limit} job listings...")
 
@@ -159,6 +158,8 @@ class SAPJobListingsScraper:
 
         last_count   = 0
         no_change_ct = 0
+        max_no_change = 5  # Increased tolerance
+        best_count = 0  # Track the highest count we've seen
 
         while True:
             if container:
@@ -169,9 +170,45 @@ class SAPJobListingsScraper:
                 self.driver.execute_script("window.scrollBy(0, 600);")
             time.sleep(2)
 
+            # Try multiple selectors to find jobs
             jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
+
+            # Fallback selectors if primary doesn't work
+            if not jobs:
+                jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+
+            if not jobs:
+                jobs = self.driver.find_elements(By.XPATH, "//li")
+                jobs = [j for j in jobs if 'sapMLIB' in j.get_attribute('class')]
+
             current_count = len(jobs)
             logging.info(f"Jobs loaded: {current_count}")
+
+            # Track the best count
+            if current_count > best_count:
+                best_count = current_count
+                logging.info(f"New high: {best_count} jobs")
+
+            # CRITICAL FIX: If count suddenly drops significantly (by more than 10%),
+            # it means the DOM refreshed. Keep the best count.
+            if current_count < best_count * 0.9:
+                logging.warning(
+                    f"Job count dropped from {best_count} to {current_count} "
+                    "(likely DOM refresh). Using best count: {best_count}"
+                )
+                # Wait a moment for DOM to stabilize
+                time.sleep(3)
+                # Verify the best count is still valid
+                jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
+                if not jobs:
+                    jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+                current_count = len(jobs)
+                logging.info(f"After stabilization wait: {current_count} jobs")
+
+                # If we have the best count back, we're done scrolling
+                if current_count >= best_count * 0.9:
+                    logging.info(f"DOM stabilized at {current_count} jobs. Ending scroll.")
+                    break
 
             if current_count >= limit:
                 logging.info(f"Reached limit: {limit}")
@@ -179,15 +216,22 @@ class SAPJobListingsScraper:
 
             if current_count == last_count:
                 no_change_ct += 1
-                if no_change_ct >= 3:
-                    logging.info("No more jobs loading — done scrolling")
+                if no_change_ct >= max_no_change:
+                    logging.info(f"No more jobs loading — done scrolling after {no_change_ct} iterations")
                     break
             else:
                 no_change_ct = 0
 
             last_count = current_count
 
-        return min(current_count, limit)
+        # Final verification before returning
+        final_jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
+        if not final_jobs:
+            final_jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+        final_count = len(final_jobs)
+        logging.info(f"Final job count verification: {final_count}")
+
+        return min(final_count, limit)
 
     # ================== RIGHT-PANEL TEXT ==================
     def _extract_right_panel_text(self):
@@ -647,9 +691,37 @@ class SAPJobListingsScraper:
     def extract_all_loaded(self):
         logging.info("Extracting all loaded job listings...")
 
+        # Try multiple selectors to find jobs
         jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
+        if not jobs:
+            logging.warning("CSS selector found no jobs, trying XPath...")
+            jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+
+        if not jobs:
+            logging.warning("XPath selector found no jobs, trying generic li search...")
+            all_lis = self.driver.find_elements(By.XPATH, "//li")
+            jobs = [li for li in all_lis if 'sapMLIB' in li.get_attribute('class')]
+
         limit = len(jobs)
         logging.info(f"Processing {limit} jobs...")
+
+        if limit == 0:
+            logging.warning("No jobs found with any selector!")
+            logging.info("Current page HTML snippet:")
+            try:
+                snippet = self.driver.execute_script(
+                    """
+                    var lis = document.querySelectorAll('li');
+                    return {
+                        total_lis: lis.length,
+                        sample_li_classes: Array.from(lis.slice(0, 5)).map(l => l.className)
+                    };
+                    """
+                )
+                logging.info(f"Page info: {snippet}")
+            except:
+                pass
+            return
 
         extracted_count = 0
         skipped_count   = 0

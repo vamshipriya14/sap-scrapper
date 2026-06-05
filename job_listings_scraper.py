@@ -635,6 +635,28 @@ class SAPJobListingsScraper:
                 f.write(self.driver.page_source)
             return None
 
+    # ================== PEEK REQ ID FROM LIST ITEM ==================
+    def _peek_req_id_from_list_item(self, idx):
+        """
+        Read the requisition ID text directly from the list item element
+        WITHOUT clicking it. Used to skip already-seen jobs cheaply.
+        Returns empty string if not found.
+        """
+        try:
+            return self.driver.execute_script(
+                """
+                var items = document.querySelectorAll('li.sapMLIB');
+                if (items.length <= arguments[0]) return '';
+                var el = items[arguments[0]];
+                var t = (el.innerText || el.textContent || '').replace(/\\s+/g,' ').trim();
+                var m = t.match(/(\\d{4,})/);
+                return m ? m[1] : '';
+                """,
+                idx
+            ) or ''
+        except Exception:
+            return ''
+
     # ================== SCROLL + EXTRACT (PARALLEL) ==================
     def scroll_and_extract_all(self, limit=Limit):
         """
@@ -643,20 +665,22 @@ class SAPJobListingsScraper:
 
         Strategy:
           1. Get currently visible jobs
-          2. Extract any not yet processed (by DOM index within current window)
-          3. Scroll to load more
-          4. Repeat until no new jobs appear or limit reached
-          5. Use seen_requisition_ids for deduplication (handles DOM node recycling)
+          2. Peek req_id from each list item — skip immediately if already seen
+          3. Click and extract only truly new jobs
+          4. Scroll to load more (only after all visible jobs are processed)
+          5. Stop when no new req_ids appear across 4 consecutive scrolls
+
+        Key insight: SAP UI5 growing list APPENDS new items at the bottom.
+        Items 0..N-1 are stable; only items beyond the previous high-water mark are new.
+        We use high_water_mark to skip re-peeking already-processed indices,
+        and seen_requisition_ids as the true dedup guard.
         """
         logging.info(f"Starting parallel scroll+extract (limit={limit})...")
 
         container = self._find_container()
 
-        # Track which DOM indices we've already processed in the current scroll window.
-        # Reset after each scroll since SAP may recycle DOM node positions.
-        # Deduplication is handled by seen_requisition_ids instead.
-        extracted_indices = set()
-        no_new_scroll_ct  = 0
+        high_water_mark   = 0   # highest DOM index we have fully processed
+        no_new_items_ct   = 0   # consecutive scrolls with zero new req_ids
         last_visible_count = 0
 
         while len(self.all_jobs) < limit:
@@ -665,9 +689,9 @@ class SAPJobListingsScraper:
             jobs = self._get_visible_jobs()
             current_count = len(jobs)
             logging.info(
-                f"Visible jobs in DOM: {current_count}  |  "
-                f"Extracted so far: {len(self.all_jobs)}  |  "
-                f"Unique req IDs: {len(self.seen_requisition_ids)}"
+                f"Visible: {current_count}  |  Extracted: {len(self.all_jobs)}  |  "
+                f"Unique req IDs: {len(self.seen_requisition_ids)}  |  "
+                f"High-water mark: {high_water_mark}"
             )
 
             # ── DOM empty — wait and retry once ──
@@ -680,18 +704,39 @@ class SAPJobListingsScraper:
                     logging.warning("DOM still empty after wait — stopping extraction")
                     break
 
-            # ── 2. Extract new jobs from current visible window ──
-            new_indices = [i for i in range(current_count) if i not in extracted_indices]
+            # ── 2. Find truly new indices (beyond high_water_mark) ──
+            new_indices = list(range(high_water_mark, current_count))
 
-            if new_indices:
+            if not new_indices:
+                # Nothing beyond high-water — scroll to load more
+                no_new_items_ct += 1
                 logging.info(
-                    f"Extracting {len(new_indices)} jobs "
-                    f"(DOM indices {new_indices[0]}–{new_indices[-1]})..."
+                    f"No new indices beyond high-water mark {high_water_mark} "
+                    f"({no_new_items_ct}/4 patience)"
                 )
+                if no_new_items_ct >= 4:
+                    logging.info("No new jobs after 4 consecutive scrolls — end of list")
+                    break
+            else:
+                no_new_items_ct = 0
+                logging.info(
+                    f"Processing {len(new_indices)} new indices "
+                    f"({high_water_mark}–{current_count - 1})..."
+                )
+
                 for idx in new_indices:
                     if len(self.all_jobs) >= limit:
                         logging.info(f"Reached limit of {limit} jobs")
                         break
+
+                    # ── Peek req_id without clicking ──
+                    peeked_req = self._peek_req_id_from_list_item(idx)
+                    if peeked_req and peeked_req in self.seen_requisition_ids:
+                        logging.info(f"  ~ Index {idx}: req {peeked_req} already seen — skip click")
+                        high_water_mark = idx + 1
+                        continue
+
+                    # ── Click and extract ──
                     try:
                         details = self.extract_job_details(idx)
                         if details and details.get('requisition_id'):
@@ -704,34 +749,20 @@ class SAPJobListingsScraper:
                                     f"{details.get('job_title')} ({req_id})"
                                 )
                             else:
-                                logging.info(f"  ~ Duplicate req_id {req_id} — skipped")
+                                logging.info(f"  ~ Index {idx}: req {req_id} duplicate after click — skip")
                         else:
-                            logging.warning(f"  ✗ No details for DOM index {idx} — queued for retry")
+                            logging.warning(f"  ✗ No details for index {idx} — queued for retry")
                             self.failed_indices.append(idx)
                     except Exception as e:
-                        logging.error(f"  Error at DOM index {idx}: {e}")
+                        logging.error(f"  Error at index {idx}: {e}")
                         self.failed_indices.append(idx)
 
-                    extracted_indices.add(idx)
-
-                no_new_scroll_ct = 0
-
-            else:
-                # No new indices in this scroll window
-                no_new_scroll_ct += 1
-                logging.info(f"No new DOM indices to extract ({no_new_scroll_ct}/4 patience)")
-                if no_new_scroll_ct >= 4:
-                    logging.info("No new jobs after 4 consecutive scrolls — end of list reached")
-                    break
+                    high_water_mark = idx + 1
 
             if len(self.all_jobs) >= limit:
                 break
 
             # ── 3. Scroll to trigger SAP growing list ──
-            # Reset extracted_indices after scroll — SAP may reuse DOM positions for new jobs.
-            # seen_requisition_ids handles deduplication if the same job reappears.
-            extracted_indices.clear()
-
             scrolled = False
             if container:
                 try:
@@ -752,14 +783,10 @@ class SAPJobListingsScraper:
 
             time.sleep(2.5)
 
-            # ── 4. Check if SAP loaded more items ──
+            # ── 4. Log if SAP loaded more items ──
             new_count = len(self._get_visible_jobs())
             if new_count > last_visible_count:
                 logging.info(f"SAP loaded more jobs: {last_visible_count} → {new_count}")
-                last_visible_count = new_count
-            elif new_count == last_visible_count and no_new_scroll_ct > 0:
-                logging.info("Visible count stable and no new extractions — likely end of list")
-
             last_visible_count = new_count
 
         logging.info("=" * 60)

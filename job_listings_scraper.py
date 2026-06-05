@@ -41,14 +41,19 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 log_filename = f"job_listings_scraper_{timestamp}.log"
 
+# Ensure immediate flush and UTF-8 encoding
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8'),
+        logging.FileHandler(log_filename, encoding='utf-8', delay=False),
         logging.StreamHandler(sys.stdout)
-    ]
+    ],
+    force=True
 )
+logging.info("=" * 60)
+logging.info("SAP Job Listings Scraper Started")
+logging.info("=" * 60)
 
 
 # ================== SCRAPER ==================
@@ -60,6 +65,7 @@ class SAPJobListingsScraper:
         self.seen_requisition_ids = set()
         self.failed_indices = []
 
+        logging.info("Initializing Selenium WebDriver...")
         options = webdriver.ChromeOptions()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -69,7 +75,12 @@ class SAPJobListingsScraper:
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         driver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
-        self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
+        try:
+            self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
+            logging.info(f"✓ WebDriver initialized (ChromeDriver: {driver_path})")
+        except Exception as e:
+            logging.error(f"Failed to initialize WebDriver: {e}")
+            raise
         self.wait = WebDriverWait(self.driver, 15)
 
     # ================== LOGIN ==================
@@ -80,30 +91,47 @@ class SAPJobListingsScraper:
         password   = os.getenv("SAP_PASSWORD")
 
         if not all([company_id, agency_id, email, password]):
-            raise Exception("Missing SAP credentials")
+            missing = [k for k, v in {
+                "SAP_COMPANY_ID": company_id,
+                "SAP_AGENCY_ID": agency_id,
+                "SAP_EMAIL": email,
+                "SAP_PASSWORD": password
+            }.items() if not v]
+            raise Exception(f"Missing SAP credentials: {', '.join(missing)}")
 
-        self.driver.get(self.url)
-        time.sleep(2)
+        try:
+            logging.info("Navigating to login URL...")
+            self.driver.get(self.url)
+            time.sleep(2)
 
-        self.wait.until(EC.presence_of_element_located((By.NAME, "companyId"))).send_keys(company_id)
-        self.driver.find_element(By.CSS_SELECTOR, "button[id*='continueButton']").click()
-        time.sleep(3)
+            logging.info("Entering company ID...")
+            self.wait.until(EC.presence_of_element_located((By.NAME, "companyId"))).send_keys(company_id)
+            self.driver.find_element(By.CSS_SELECTOR, "button[id*='continueButton']").click()
+            time.sleep(3)
 
-        self.wait.until(
-            EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder,'Agency')]"))
-        ).send_keys(agency_id)
-        self.driver.find_element(By.XPATH, "//input[contains(@placeholder,'Email')]").send_keys(email)
-        self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(password)
-        self.driver.find_element(By.CSS_SELECTOR, "button[id*='login']").click()
-        time.sleep(5)
+            logging.info("Entering agency credentials...")
+            self.wait.until(
+                EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder,'Agency')]"))
+            ).send_keys(agency_id)
+            self.driver.find_element(By.XPATH, "//input[contains(@placeholder,'Email')]").send_keys(email)
+            self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(password)
+            self.driver.find_element(By.CSS_SELECTOR, "button[id*='login']").click()
+            time.sleep(5)
 
-        if "login" in self.driver.current_url.lower():
+            if "login" in self.driver.current_url.lower():
+                self.driver.save_screenshot("login_error.png")
+                with open("login_error.html", "w", encoding="utf-8") as f:
+                    f.write(self.driver.page_source)
+                logging.error(f"Login failed! Current URL: {self.driver.current_url}")
+                raise Exception("Login failed - still on login page after credentials submitted")
+
+            logging.info(f"✓ Logged in successfully. Current URL: {self.driver.current_url}")
+        except Exception as e:
+            logging.error(f"Login process failed: {e}")
             self.driver.save_screenshot("login_error.png")
             with open("login_error.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
-            raise Exception("Login failed")
-
-        logging.info("Logged in successfully")
+            raise
 
     # ================== SCROLL & LOAD ==================
     def scroll_and_load_all(self, limit=Limit):
@@ -829,6 +857,15 @@ class SAPJobListingsScraper:
         └─────────────────────────────────────────────────────────────────────┘
         Returns (new_jr_nos, deactivated_jr_nos, reactivated_jr_nos).
         """
+        # CRITICAL SAFEGUARD: Prevent disaster if extract is empty
+        if not extracted_jr_nos:
+            logging.error(
+                "CRITICAL: extracted_jr_nos is EMPTY! This indicates scraper FAILED to extract jobs. "
+                "Refusing to mark records as inactive to prevent data loss. "
+                "Check logs for extraction errors."
+            )
+            return set(), set()  # Return empty — no changes made
+
         now_iso = datetime.now().isoformat()
 
         # Fetch post-upload DB state
@@ -914,12 +951,34 @@ def main():
 
         scraper.save_excel()
 
+        # ── CRITICAL VALIDATION: Check if extraction produced any results ──
+        if not scraper.all_jobs:
+            logging.error(
+                "CRITICAL FAILURE: Scraper extracted ZERO jobs! "
+                "This may indicate: login failure, page structure change, or extraction error. "
+                "Aborting upload/deactivation to prevent data loss."
+            )
+            logging.info("Script terminating without modifying database.")
+            return
+
+        logging.info(f"Extraction successful: {len(scraper.all_jobs)} jobs extracted")
+
         # ── Set of jr_nos extracted in THIS run ──
         extracted_jr_nos = {
             scraper.clean(r.get("requisition_id"))
             for r in scraper.all_jobs
             if scraper.clean(r.get("requisition_id"))
         }
+
+        if not extracted_jr_nos:
+            logging.error(
+                "CRITICAL FAILURE: No valid requisition IDs extracted from jobs! "
+                "Aborting upload/deactivation to prevent data loss."
+            )
+            logging.info("Script terminating without modifying database.")
+            return
+
+        logging.info(f"Valid requisition IDs: {len(extracted_jr_nos)}")
 
         # ── Snapshot DB BEFORE upload (jr_no + jr_status) ──
         pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
@@ -970,6 +1029,10 @@ def main():
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 
+    except Exception as e:
+        logging.exception(f"FATAL ERROR in main: {e}")
+        logging.error("Script terminated with exception. Database unchanged.")
+        raise
     finally:
         scraper.close()
 

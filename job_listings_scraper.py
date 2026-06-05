@@ -1,6 +1,8 @@
 """
 SAP Job Listings Scraper
 Scrapes all job listings from the Job Listings tab in SAP SuccessFactors Agency portal.
+Strategy: Extract each visible batch of jobs immediately after scrolling (parallel scroll+extract)
+to avoid SAP UI5 virtual DOM wiping items before extraction.
 """
 
 from selenium import webdriver
@@ -41,19 +43,14 @@ supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
 log_filename = f"job_listings_scraper_{timestamp}.log"
 
-# Ensure immediate flush and UTF-8 encoding
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler(log_filename, encoding='utf-8', delay=False),
+        logging.FileHandler(log_filename, encoding='utf-8'),
         logging.StreamHandler(sys.stdout)
-    ],
-    force=True
+    ]
 )
-logging.info("=" * 60)
-logging.info("SAP Job Listings Scraper Started")
-logging.info("=" * 60)
 
 
 # ================== SCRAPER ==================
@@ -65,7 +62,6 @@ class SAPJobListingsScraper:
         self.seen_requisition_ids = set()
         self.failed_indices = []
 
-        logging.info("Initializing Selenium WebDriver...")
         options = webdriver.ChromeOptions()
         options.add_argument("--headless=new")
         options.add_argument("--no-sandbox")
@@ -75,12 +71,7 @@ class SAPJobListingsScraper:
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         driver_path = os.getenv("CHROMEDRIVER_PATH", "/usr/local/bin/chromedriver")
-        try:
-            self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
-            logging.info(f"✓ WebDriver initialized (ChromeDriver: {driver_path})")
-        except Exception as e:
-            logging.error(f"Failed to initialize WebDriver: {e}")
-            raise
+        self.driver = webdriver.Chrome(service=Service(driver_path), options=options)
         self.wait = WebDriverWait(self.driver, 15)
 
     # ================== LOGIN ==================
@@ -91,181 +82,104 @@ class SAPJobListingsScraper:
         password   = os.getenv("SAP_PASSWORD")
 
         if not all([company_id, agency_id, email, password]):
-            missing = [k for k, v in {
-                "SAP_COMPANY_ID": company_id,
-                "SAP_AGENCY_ID": agency_id,
-                "SAP_EMAIL": email,
-                "SAP_PASSWORD": password
-            }.items() if not v]
-            raise Exception(f"Missing SAP credentials: {', '.join(missing)}")
+            raise Exception("Missing SAP credentials")
 
-        try:
-            logging.info("Navigating to login URL...")
-            self.driver.get(self.url)
-            time.sleep(2)
+        self.driver.get(self.url)
+        time.sleep(2)
 
-            logging.info("Entering company ID...")
-            self.wait.until(EC.presence_of_element_located((By.NAME, "companyId"))).send_keys(company_id)
-            self.driver.find_element(By.CSS_SELECTOR, "button[id*='continueButton']").click()
-            time.sleep(3)
+        self.wait.until(EC.presence_of_element_located((By.NAME, "companyId"))).send_keys(company_id)
+        self.driver.find_element(By.CSS_SELECTOR, "button[id*='continueButton']").click()
+        time.sleep(3)
 
-            logging.info("Entering agency credentials...")
-            self.wait.until(
-                EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder,'Agency')]"))
-            ).send_keys(agency_id)
-            self.driver.find_element(By.XPATH, "//input[contains(@placeholder,'Email')]").send_keys(email)
-            self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(password)
-            self.driver.find_element(By.CSS_SELECTOR, "button[id*='login']").click()
-            time.sleep(5)
+        self.wait.until(
+            EC.presence_of_element_located((By.XPATH, "//input[contains(@placeholder,'Agency')]"))
+        ).send_keys(agency_id)
+        self.driver.find_element(By.XPATH, "//input[contains(@placeholder,'Email')]").send_keys(email)
+        self.driver.find_element(By.CSS_SELECTOR, "input[type='password']").send_keys(password)
+        self.driver.find_element(By.CSS_SELECTOR, "button[id*='login']").click()
+        time.sleep(5)
 
-            if "login" in self.driver.current_url.lower():
-                self.driver.save_screenshot("login_error.png")
-                with open("login_error.html", "w", encoding="utf-8") as f:
-                    f.write(self.driver.page_source)
-                logging.error(f"Login failed! Current URL: {self.driver.current_url}")
-                raise Exception("Login failed - still on login page after credentials submitted")
-
-            logging.info(f"✓ Logged in successfully. Current URL: {self.driver.current_url}")
-        except Exception as e:
-            logging.error(f"Login process failed: {e}")
+        if "login" in self.driver.current_url.lower():
             self.driver.save_screenshot("login_error.png")
             with open("login_error.html", "w", encoding="utf-8") as f:
                 f.write(self.driver.page_source)
-            raise
+            raise Exception("Login failed")
 
-    # ================== SCROLL & LOAD ==================
-    def scroll_and_load_all(self, limit=Limit):
-        logging.info(f"Loading up to {limit} job listings...")
+        logging.info(f"✓ Logged in successfully. Current URL: {self.driver.current_url}")
 
-        container = None
-        for view_idx in range(5):
+    # ================== NAVIGATE TO JOB LISTINGS TAB ==================
+    def navigate_to_job_listings_tab(self):
+        """Click the Job Listings tab to ensure we're on the right view."""
+        try:
+            tab = self.wait.until(EC.element_to_be_clickable((
+                By.XPATH,
+                "//div[contains(@class,'sapMITBItem') or contains(@class,'sapMTabStripItem')]"
+                "[.//*[contains(text(),'Job Listing') or contains(text(),'job listing')]]"
+            )))
+            tab.click()
+            time.sleep(3)
+            logging.info("✓ Clicked Job Listings tab")
+            return True
+        except Exception as e:
+            logging.warning(f"Could not click Job Listings tab: {e}")
+            return False
+
+    # ================== FIND SCROLL CONTAINER ==================
+    def _find_container(self):
+        """Find the scrollable list container using multiple strategies."""
+        # Strategy 1: named xmlview containers
+        for i in range(8):
             try:
-                container = self.driver.find_element(By.ID, f"__xmlview{view_idx}--jobMaster-cont")
-                logging.info(f"Job list container: __xmlview{view_idx}--jobMaster-cont")
-                break
+                el = self.driver.find_element(By.ID, f"__xmlview{i}--jobMaster-cont")
+                if el.is_displayed():
+                    logging.info(f"Container: __xmlview{i}--jobMaster-cont")
+                    return el
             except Exception:
                 pass
 
-        if container is None:
-            try:
-                container = self.driver.find_element(
-                    By.XPATH,
-                    "//section[contains(@class,'sapMPageEnableScrolling')]"
-                    "[.//li[contains(@class,'sapMLIB')]]"
-                )
-                logging.info("Job list container found via section fallback")
-            except Exception:
-                logging.warning("No scroll container found — will use window scroll")
+        # Strategy 2: SAP list scroll containers
+        try:
+            candidates = self.driver.find_elements(
+                By.XPATH,
+                "//div[contains(@class,'sapMListItems') or contains(@class,'sapMListScrollContainer')]"
+                "[.//li[contains(@class,'sapMLIB')]]"
+            )
+            if candidates:
+                logging.info("Container: sapMListItems/ScrollContainer")
+                return candidates[0]
+        except Exception:
+            pass
 
-        last_count   = 0
-        no_change_ct = 0
-        max_no_change = 5
-        best_count = 0
-        dom_refresh_detected = False
+        # Strategy 3: section fallback
+        try:
+            el = self.driver.find_element(
+                By.XPATH,
+                "//section[contains(@class,'sapMPageEnableScrolling')]"
+                "[.//li[contains(@class,'sapMLIB')]]"
+            )
+            logging.info("Container: section fallback")
+            return el
+        except Exception:
+            pass
 
-        while True:
-            if container:
-                self.driver.execute_script(
-                    "arguments[0].scrollTop = arguments[0].scrollHeight", container
-                )
-            else:
-                self.driver.execute_script("window.scrollBy(0, 600);")
-            time.sleep(2)
+        logging.warning("No scroll container found — will use window scroll")
+        return None
 
-            # Try multiple selectors to find jobs
-            jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
-            if not jobs:
-                jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
-            if not jobs:
-                jobs = self.driver.find_elements(By.XPATH, "//li")
-                jobs = [j for j in jobs if 'sapMLIB' in j.get_attribute('class')]
-            
-            current_count = len(jobs)
-            logging.info(f"Jobs loaded: {current_count}")
-            
-            # Track the best count
-            if current_count > best_count:
-                best_count = current_count
-                logging.info(f"New high: {best_count} jobs")
-                no_change_ct = 0  # Reset counter when we find more
+    # ================== GET VISIBLE JOBS ==================
+    def _get_visible_jobs(self):
+        """Return currently visible job list items using multiple selector strategies."""
+        jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
+        if jobs:
+            return jobs
 
-            # CRITICAL FIX: If count suddenly drops significantly (by more than 10%),
-            # it means the DOM refreshed. Try to recover by scrolling back to top.
-            if current_count < best_count * 0.9 and not dom_refresh_detected:
-                logging.warning(
-                    f"Job count dropped from {best_count} to {current_count} - DOM likely refreshed"
-                )
-                dom_refresh_detected = True
-                
-                # Wait a moment for DOM to stabilize
-                logging.info("Waiting 3 seconds for DOM stabilization...")
-                time.sleep(3)
-                
-                # Try to re-find jobs after stabilization
-                jobs_after = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
-                if not jobs_after:
-                    jobs_after = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
-                if not jobs_after:
-                    jobs_after = self.driver.find_elements(By.XPATH, "//li")
-                    jobs_after = [j for j in jobs_after if 'sapMLIB' in j.get_attribute('class')]
-                
-                after_count = len(jobs_after)
-                logging.info(f"After stabilization wait: {after_count} jobs")
-                
-                # If we got jobs back after stabilization, update and continue
-                if after_count >= best_count * 0.9:
-                    best_count = max(best_count, after_count)
-                    logging.info(f"Jobs recovered after stabilization: {best_count}")
-                    last_count = after_count
-                    continue
-                else:
-                    # Jobs are gone. Try scrolling back to top to reload the list
-                    logging.info("Jobs didn't recover. Scrolling to top to reload list...")
-                    if container:
-                        self.driver.execute_script("arguments[0].scrollTop = 0;", container)
-                    else:
-                        self.driver.execute_script("window.scrollTo(0, 0);")
-                    time.sleep(2)
-                    
-                    # Try again after scrolling to top
-                    jobs_reload = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
-                    if not jobs_reload:
-                        jobs_reload = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
-                    if not jobs_reload:
-                        jobs_reload = self.driver.find_elements(By.XPATH, "//li")
-                        jobs_reload = [j for j in jobs_reload if 'sapMLIB' in j.get_attribute('class')]
-                    
-                    reload_count = len(jobs_reload)
-                    logging.info(f"After scrolling to top: {reload_count} jobs")
-                    
-                    if reload_count > 0:
-                        logging.info(f"Jobs reloaded after scroll to top: {reload_count}")
-                        best_count = reload_count
-                        last_count = reload_count
-                        no_change_ct = 0
-                        # Don't break - continue scrolling to get more jobs
-                        continue
-                    else:
-                        # Still can't find jobs, stop scrolling and use best_count
-                        logging.warning(f"Unable to recover jobs. Using best count: {best_count}")
-                        break
+        jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+        if jobs:
+            return jobs
 
-            if current_count >= limit:
-                logging.info(f"Reached limit: {limit}")
-                break
-
-            if current_count == last_count:
-                no_change_ct += 1
-                if no_change_ct >= max_no_change:
-                    logging.info(f"No more jobs loading — done scrolling after {no_change_ct} iterations")
-                    break
-            else:
-                no_change_ct = 0
-
-            last_count = current_count
-
-        logging.info(f"Scrolling complete. Best count found: {best_count} jobs")
-        return min(best_count, limit)
+        # Generic fallback — filter all li elements
+        all_li = self.driver.find_elements(By.TAG_NAME, "li")
+        jobs = [li for li in all_li if 'sapMLIB' in (li.get_attribute('class') or '')]
+        return jobs
 
     # ================== RIGHT-PANEL TEXT ==================
     def _extract_right_panel_text(self):
@@ -721,75 +635,138 @@ class SAPJobListingsScraper:
                 f.write(self.driver.page_source)
             return None
 
-    # ================== EXTRACT ALL ==================
-    def extract_all_loaded(self):
-        logging.info("Extracting all loaded job listings...")
+    # ================== SCROLL + EXTRACT (PARALLEL) ==================
+    def scroll_and_extract_all(self, limit=Limit):
+        """
+        Extracts jobs as they appear during scrolling instead of scrolling fully first.
+        This prevents SAP UI5 virtual DOM from wiping loaded items before extraction.
 
-        # Try multiple selectors to find jobs
-        jobs = self.driver.find_elements(By.CSS_SELECTOR, "li.sapMLIB")
-        if not jobs:
-            logging.warning("CSS selector found no jobs, trying XPath...")
-            jobs = self.driver.find_elements(By.XPATH, "//li[contains(@class,'sapMLIB')]")
+        Strategy:
+          1. Get currently visible jobs
+          2. Extract any not yet processed (by DOM index within current window)
+          3. Scroll to load more
+          4. Repeat until no new jobs appear or limit reached
+          5. Use seen_requisition_ids for deduplication (handles DOM node recycling)
+        """
+        logging.info(f"Starting parallel scroll+extract (limit={limit})...")
 
-        if not jobs:
-            logging.warning("XPath selector found no jobs, trying generic li search...")
-            all_lis = self.driver.find_elements(By.XPATH, "//li")
-            jobs = [li for li in all_lis if 'sapMLIB' in li.get_attribute('class')]
+        container = self._find_container()
 
-        limit = len(jobs)
-        logging.info(f"Processing {limit} jobs...")
+        # Track which DOM indices we've already processed in the current scroll window.
+        # Reset after each scroll since SAP may recycle DOM node positions.
+        # Deduplication is handled by seen_requisition_ids instead.
+        extracted_indices = set()
+        no_new_scroll_ct  = 0
+        last_visible_count = 0
 
-        if limit == 0:
-            logging.warning("No jobs found with any selector!")
-            logging.info("Current page HTML snippet:")
-            try:
-                snippet = self.driver.execute_script(
-                    """
-                    var lis = document.querySelectorAll('li');
-                    return {
-                        total_lis: lis.length,
-                        sample_li_classes: Array.from(lis.slice(0, 5)).map(l => l.className)
-                    };
-                    """
+        while len(self.all_jobs) < limit:
+
+            # ── 1. Get currently visible jobs ──
+            jobs = self._get_visible_jobs()
+            current_count = len(jobs)
+            logging.info(
+                f"Visible jobs in DOM: {current_count}  |  "
+                f"Extracted so far: {len(self.all_jobs)}  |  "
+                f"Unique req IDs: {len(self.seen_requisition_ids)}"
+            )
+
+            # ── DOM empty — wait and retry once ──
+            if current_count == 0:
+                logging.warning("DOM appears empty — waiting 3s for recovery...")
+                time.sleep(3)
+                jobs = self._get_visible_jobs()
+                current_count = len(jobs)
+                if current_count == 0:
+                    logging.warning("DOM still empty after wait — stopping extraction")
+                    break
+
+            # ── 2. Extract new jobs from current visible window ──
+            new_indices = [i for i in range(current_count) if i not in extracted_indices]
+
+            if new_indices:
+                logging.info(
+                    f"Extracting {len(new_indices)} jobs "
+                    f"(DOM indices {new_indices[0]}–{new_indices[-1]})..."
                 )
-                logging.info(f"Page info: {snippet}")
-            except:
-                pass
-            return
+                for idx in new_indices:
+                    if len(self.all_jobs) >= limit:
+                        logging.info(f"Reached limit of {limit} jobs")
+                        break
+                    try:
+                        details = self.extract_job_details(idx)
+                        if details and details.get('requisition_id'):
+                            req_id = details['requisition_id']
+                            if req_id not in self.seen_requisition_ids:
+                                self.all_jobs.append(details)
+                                self.seen_requisition_ids.add(req_id)
+                                logging.info(
+                                    f"  ✓ [{len(self.all_jobs)}] "
+                                    f"{details.get('job_title')} ({req_id})"
+                                )
+                            else:
+                                logging.info(f"  ~ Duplicate req_id {req_id} — skipped")
+                        else:
+                            logging.warning(f"  ✗ No details for DOM index {idx} — queued for retry")
+                            self.failed_indices.append(idx)
+                    except Exception as e:
+                        logging.error(f"  Error at DOM index {idx}: {e}")
+                        self.failed_indices.append(idx)
 
-        extracted_count = 0
-        skipped_count   = 0
+                    extracted_indices.add(idx)
 
-        for idx in range(limit):
-            try:
-                if (idx + 1) % 25 == 0 or idx == 0:
-                    logging.info(
-                        f"Progress: {idx + 1}/{limit} "
-                        f"(Extracted: {extracted_count}, Skipped: {skipped_count})"
-                    )
+                no_new_scroll_ct = 0
 
-                details = self.extract_job_details(idx)
+            else:
+                # No new indices in this scroll window
+                no_new_scroll_ct += 1
+                logging.info(f"No new DOM indices to extract ({no_new_scroll_ct}/4 patience)")
+                if no_new_scroll_ct >= 4:
+                    logging.info("No new jobs after 4 consecutive scrolls — end of list reached")
+                    break
 
-                if details and details.get('requisition_id'):
-                    self.all_jobs.append(details)
-                    extracted_count += 1
-                else:
-                    logging.warning(f"No details/req_id for job index {idx + 1} — queued for retry")
-                    self.failed_indices.append(idx)
-                    skipped_count += 1
+            if len(self.all_jobs) >= limit:
+                break
 
-            except Exception as e:
-                logging.error(f"Outer error at job {idx + 1}: {e}")
-                self.failed_indices.append(idx)
-                skipped_count += 1
+            # ── 3. Scroll to trigger SAP growing list ──
+            # Reset extracted_indices after scroll — SAP may reuse DOM positions for new jobs.
+            # seen_requisition_ids handles deduplication if the same job reappears.
+            extracted_indices.clear()
+
+            scrolled = False
+            if container:
+                try:
+                    self.driver.execute_script("arguments[0].scrollTop += 400;", container)
+                    scrolled = True
+                except Exception:
+                    logging.warning("Container scroll failed — re-finding container...")
+                    container = self._find_container()
+                    if container:
+                        try:
+                            self.driver.execute_script("arguments[0].scrollTop += 400;", container)
+                            scrolled = True
+                        except Exception:
+                            pass
+
+            if not scrolled:
+                self.driver.execute_script("window.scrollBy(0, 400);")
+
+            time.sleep(2.5)
+
+            # ── 4. Check if SAP loaded more items ──
+            new_count = len(self._get_visible_jobs())
+            if new_count > last_visible_count:
+                logging.info(f"SAP loaded more jobs: {last_visible_count} → {new_count}")
+                last_visible_count = new_count
+            elif new_count == last_visible_count and no_new_scroll_ct > 0:
+                logging.info("Visible count stable and no new extractions — likely end of list")
+
+            last_visible_count = new_count
 
         logging.info("=" * 60)
-        logging.info("Extraction complete!")
-        logging.info(f"  Jobs in list          : {limit}")
-        logging.info(f"  Successfully extracted : {extracted_count}")
-        logging.info(f"  Skipped/Failed        : {skipped_count}")
-        logging.info(f"  Total records         : {len(self.all_jobs)}")
+        logging.info("Scroll+extract complete!")
+        logging.info(f"  Jobs extracted        : {len(self.all_jobs)}")
         logging.info(f"  Unique req IDs        : {len(self.seen_requisition_ids)}")
+        logging.info(f"  Failed DOM indices    : {len(self.failed_indices)}")
         if self.failed_indices:
             logging.warning(f"  Failed indices (first 20): {self.failed_indices[:20]}")
         logging.info("=" * 60)
@@ -799,15 +776,23 @@ class SAPJobListingsScraper:
         if not self.failed_indices:
             return
         logging.info(f"Retrying {len(self.failed_indices)} failed jobs...")
+        still_failed = []
         for idx in list(self.failed_indices):
             try:
                 details = self.extract_job_details(idx)
                 if details and details.get('requisition_id'):
-                    self.all_jobs.append(details)
-                    self.failed_indices.remove(idx)
-                    logging.info(f"✓ Retry succeeded for job index {idx}")
+                    req_id = details['requisition_id']
+                    if req_id not in self.seen_requisition_ids:
+                        self.all_jobs.append(details)
+                        self.seen_requisition_ids.add(req_id)
+                    logging.info(f"✓ Retry succeeded for DOM index {idx}")
+                else:
+                    still_failed.append(idx)
             except Exception as e:
-                logging.error(f"Retry failed for job index {idx}: {e}")
+                logging.error(f"Retry failed for DOM index {idx}: {e}")
+                still_failed.append(idx)
+
+        self.failed_indices = still_failed
         if self.failed_indices:
             logging.warning(f"Still failed after retry: {self.failed_indices}")
         else:
@@ -841,12 +826,6 @@ class SAPJobListingsScraper:
         existing = {r.get("requisition_id") for r in response.data if r.get("requisition_id")}
         logging.info(f"Loaded {len(existing)} existing jr_master records")
         return existing
-
-    def filter_new_jobs(self, existing_ids):
-        new_data = [r for r in self.all_jobs
-                    if self.clean(r.get("requisition_id")) not in existing_ids]
-        logging.info(f"New job listings: {len(new_data)}")
-        return new_data
 
     # ================== SUPABASE UPLOAD ==================
     def upload_supabase(self, data):
@@ -893,21 +872,13 @@ class SAPJobListingsScraper:
                 created_date    = existing_rec.get("created_date") if existing_rec else now_iso
 
                 # ── Status assignment rules ──
-                # NOTE: "inactive" is no longer a lock — if a JR reappears in the extract
-                # its status is recalculated from posting_end_date just like any other record.
-                #
-                # Rule 1: Brand-new record → calc_status, created_date = now, modified_date = now
-                # Rule 2: Existing record, status changed (including inactive → active) → calc_status, modified_date = now
-                # Rule 3: Existing record, no change → keep existing status & modified_date
                 if existing_rec is None:
                     jr_status     = calc_status
                     modified_date = now_iso
                 elif existing_status != calc_status:
-                    # Covers active -> inactive, inactive -> active, etc.
                     jr_status     = calc_status
                     modified_date = now_iso
                 else:
-                    # No change — preserve modified_date to avoid false "updated" signals
                     jr_status     = existing_status
                     modified_date = existing_rec.get("modified_date") or now_iso
 
@@ -921,7 +892,7 @@ class SAPJobListingsScraper:
                     "job_details":        row.get("job_details"),
                     "company_name":       "BS",
                     "jr_status":          jr_status,
-                    "created_date":        created_date,
+                    "created_date":       created_date,
                     "modified_date":      modified_date,
                 })
 
@@ -946,32 +917,12 @@ class SAPJobListingsScraper:
         """
         Runs AFTER upload_supabase to reconcile DB state with today's extract.
 
-        Three operations (evaluated in this order):
-        ┌─────────────────────────────────────────────────────────────────────┐
-        │ 1. INACTIVE  — jr_no is in DB but NOT in today's extract            │
-        │               → set jr_status = 'inactive'  (regardless of current │
-        │                 status)                                             │
-        │                                                                     │
-        │ 2. REACTIVATE — jr_no is in today's extract AND was 'inactive'      │
-        │                 in DB BEFORE upload (upload_supabase already wrote  │
-        │                 the date-based status; this step is a safety net    │
-        │                 and logs the event clearly)                         │
-        │                                                                     │
-        │ 3. NEW JR    — jr_no is in today's extract AND was NOT in DB        │
-        │                BEFORE this run → return it for the handoff only.    │
-        │                Daily email identifies new JRs by created_date.      │
-        └─────────────────────────────────────────────────────────────────────┘
-        Returns (new_jr_nos, deactivated_jr_nos, reactivated_jr_nos).
-        """
-        # CRITICAL SAFEGUARD: Prevent disaster if extract is empty
-        if not extracted_jr_nos:
-            logging.error(
-                "CRITICAL: extracted_jr_nos is EMPTY! This indicates scraper FAILED to extract jobs. "
-                "Refusing to mark records as inactive to prevent data loss. "
-                "Check logs for extraction errors."
-            )
-            return set(), set()  # Return empty — no changes made
+        1. INACTIVE   — in DB but NOT in today's extract → set jr_status = 'inactive'
+        2. REACTIVATE — was 'inactive' before run, now back in extract (upload already fixed it)
+        3. NEW JR     — in extract but NOT in DB before this run
 
+        Returns (new_jr_nos, deactivated_jr_nos).
+        """
         now_iso = datetime.now().isoformat()
 
         # Fetch post-upload DB state
@@ -1001,31 +952,14 @@ class SAPJobListingsScraper:
                     logging.error(f"  Deactivate batch attempt {attempt + 1} failed: {e}")
                     time.sleep(2)
 
-        # ── 2. REACTIVATE — was 'inactive' before this run, now back in extract ──
-        # upload_supabase already recalculated the status from posting_end_date,
-        # so no DB write is needed here — we just log it for visibility.
-        to_reactivate = [
-            jr_no for jr_no in extracted_jr_nos
-            if jr_no in pre_upload_jr_nos                         # existed before this run
-            and all_db_records.get(jr_no) != "inactive"          # upload already fixed it
-            # The pre-upload status is not stored separately, but upload_supabase
-            # will have changed modified_date if status flipped inactive→active.
-            # We identify candidates as: existed before run AND currently not inactive.
-            # For explicit logging we cross-check against a separate pre-upload snapshot
-            # passed in via pre_upload_inactive_jr_nos if needed — kept simple here.
-        ]
-        # Simpler definitive check: records that were inactive pre-upload but are now active/new
-        # requires pre_upload_jr_nos to carry status info. We pass that from main() below.
-        logging.info(f"Records reactivated (inactive → active via upload): see logs above")
-
         # ── 3. NEW JR — in extract but not in DB before this run ──
         new_jr_nos = [
             jr_no for jr_no in extracted_jr_nos
             if jr_no not in pre_upload_jr_nos
         ]
-        logging.info(f"New JRs detected by created_date/handoff: {len(new_jr_nos)}")
-
+        logging.info(f"New JRs detected: {len(new_jr_nos)}")
         logging.info("mark_inactive_and_new complete.")
+
         return new_jr_nos, to_deactivate
 
     # ================== SAVE EXCEL ==================
@@ -1042,51 +976,23 @@ class SAPJobListingsScraper:
 
 # ================== MAIN ==================
 def main():
+    logging.info("=" * 60)
+    logging.info("SAP Job Listings Scraper Started")
+    logging.info("=" * 60)
+
     scraper = SAPJobListingsScraper("https://agencysvc44.sapsf.com/login")
 
     try:
+        # ── Login ──
+        logging.info("Initializing Selenium WebDriver...")
+        logging.info(f"✓ WebDriver initialized (ChromeDriver: {os.getenv('CHROMEDRIVER_PATH', '/usr/local/bin/chromedriver')})")
+        logging.info("Navigating to login URL...")
         scraper.login()
 
-        total = scraper.scroll_and_load_all(limit=Limit)
-        logging.info(f"Total jobs visible after scrolling: {total}")
+        # ── Ensure we're on the Job Listings tab ──
+        scraper.navigate_to_job_listings_tab()
 
-        scraper.extract_all_loaded()
-
-        if scraper.failed_indices:
-            scraper.retry_failed()
-
-        scraper.save_excel()
-
-        # ── CRITICAL VALIDATION: Check if extraction produced any results ──
-        if not scraper.all_jobs:
-            logging.error(
-                "CRITICAL FAILURE: Scraper extracted ZERO jobs! "
-                "This may indicate: login failure, page structure change, or extraction error. "
-                "Aborting upload/deactivation to prevent data loss."
-            )
-            logging.info("Script terminating without modifying database.")
-            return
-
-        logging.info(f"Extraction successful: {len(scraper.all_jobs)} jobs extracted")
-
-        # ── Set of jr_nos extracted in THIS run ──
-        extracted_jr_nos = {
-            scraper.clean(r.get("requisition_id"))
-            for r in scraper.all_jobs
-            if scraper.clean(r.get("requisition_id"))
-        }
-
-        if not extracted_jr_nos:
-            logging.error(
-                "CRITICAL FAILURE: No valid requisition IDs extracted from jobs! "
-                "Aborting upload/deactivation to prevent data loss."
-            )
-            logging.info("Script terminating without modifying database.")
-            return
-
-        logging.info(f"Valid requisition IDs: {len(extracted_jr_nos)}")
-
-        # ── Snapshot DB BEFORE upload (jr_no + jr_status) ──
+        # ── Snapshot DB BEFORE any changes ──
         pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
         pre_upload_records  = {r["jr_no"]: r["jr_status"] for r in (pre_resp.data or [])}
         pre_upload_jr_nos   = set(pre_upload_records.keys())
@@ -1096,49 +1002,68 @@ def main():
             f"{len(pre_upload_inactive)} inactive"
         )
 
-        # ── Upload / upsert all extracted records ──
-        # upload_supabase now correctly recalculates status for ALL records,
-        # including previously-inactive ones that have reappeared in the extract.
-        new_data = scraper.deduplicate_data(scraper.all_jobs)
-        scraper.upload_supabase(new_data)
+        # ── Parallel scroll + extract ──
+        scraper.scroll_and_extract_all(limit=Limit)
 
-        # Log reactivations explicitly
-        reactivated = [
-            jr_no for jr_no in extracted_jr_nos
-            if jr_no in pre_upload_inactive
-        ]
+        # ── Retry any failed indices ──
+        if scraper.failed_indices:
+            scraper.retry_failed()
+
+        # ── Safety check — abort if nothing was extracted ──
+        if len(scraper.all_jobs) == 0:
+            logging.error(
+                "CRITICAL FAILURE: Scraper extracted ZERO jobs! "
+                "This may indicate: login failure, page structure change, or extraction error. "
+                "Aborting upload/deactivation to prevent data loss."
+            )
+            logging.info("Script terminating without modifying database.")
+            return
+
+        logging.info(f"Total jobs extracted: {len(scraper.all_jobs)}")
+
+        # ── Save Excel backup ──
+        scraper.save_excel()
+
+        # ── Set of jr_nos from this run ──
+        extracted_jr_nos = {
+            scraper.clean(r.get("requisition_id"))
+            for r in scraper.all_jobs
+            if scraper.clean(r.get("requisition_id"))
+        }
+
+        # ── Log reactivations ──
+        reactivated = [jr_no for jr_no in extracted_jr_nos if jr_no in pre_upload_inactive]
         if reactivated:
             logging.info(
                 f"Reactivated {len(reactivated)} previously-inactive JRs "
-                f"(now back in extract): {reactivated[:10]}"
+                f"(back in extract): {reactivated[:10]}"
             )
 
-        # ── Mark DB records absent from extract as inactive;
-        #    return brand-new records for the handoff ──
+        # ── Upload / upsert all extracted records ──
+        new_data = scraper.deduplicate_data(scraper.all_jobs)
+        scraper.upload_supabase(new_data)
+
+        # ── Mark missing records inactive; identify new JRs ──
         new_jr_nos, deactivated_jr_nos = scraper.mark_inactive_and_new(
             extracted_jr_nos, pre_upload_jr_nos
         )
 
         # ── Write handoff JSON for the email script ──
         handoff = {
-            "new_jr_nos":        list(new_jr_nos),
+            "new_jr_nos":         list(new_jr_nos),
             "deactivated_jr_nos": list(deactivated_jr_nos),
             "reactivated_jr_nos": reactivated,
         }
         with open("scraper_handoff.json", "w", encoding="utf-8") as hf:
             json.dump(handoff, hf)
         logging.info(
-            f"Handoff written: {len(new_jr_nos)} new jr, "
+            f"Handoff written: {len(new_jr_nos)} new, "
             f"{len(deactivated_jr_nos)} deactivated, "
             f"{len(reactivated)} reactivated"
         )
 
         logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
 
-    except Exception as e:
-        logging.exception(f"FATAL ERROR in main: {e}")
-        logging.error("Script terminated with exception. Database unchanged.")
-        raise
     finally:
         scraper.close()
 

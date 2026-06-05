@@ -585,8 +585,11 @@ class SAPJobListingsScraper:
 
             logging.info(f"Job {idx + 1}: prev_req={prev_req_id!r} → new_req={new_req_id!r}")
 
-            if idx > 0 and (not new_req_id or new_req_id == prev_req_id):
-                logging.warning(f"Job {idx + 1}: panel did not update — skipping")
+            # Only skip if we had a known prev req_id AND panel still shows the same one.
+            # If prev_req_id is empty (DOM wiped between scroll and click), we cannot
+            # conclude the panel didn't update — fall through and let text extraction decide.
+            if idx > 0 and prev_req_id and (not new_req_id or new_req_id == prev_req_id):
+                logging.warning(f"Job {idx + 1}: panel did not update (prev={prev_req_id!r}) — skipping")
                 return None
 
             raw_text = self._scroll_right_panel_and_get_job_details()
@@ -618,8 +621,9 @@ class SAPJobListingsScraper:
             info['recruiter_name']  = recruiter_name
             info['recruiter_email'] = recruiter_email
 
-            if info.get('requisition_id'):
-                self.seen_requisition_ids.add(info['requisition_id'])
+            # NOTE: seen_requisition_ids.add() is intentionally NOT called here.
+            # The caller (scroll_and_extract_all / retry_failed) owns dedup tracking
+            # so it can correctly decide whether to append to all_jobs first.
 
             logging.info(
                 f"  ✓ title={info.get('job_title')!r}  req={info.get('requisition_id')!r}  "
@@ -683,7 +687,7 @@ class SAPJobListingsScraper:
         no_new_items_ct   = 0   # consecutive scrolls with zero new req_ids
         last_visible_count = 0
 
-        while len(self.all_jobs) < limit:
+        while len(self.seen_requisition_ids) < limit:
 
             # ── 1. Get currently visible jobs ──
             jobs = self._get_visible_jobs()
@@ -725,14 +729,17 @@ class SAPJobListingsScraper:
                 )
 
                 for idx in new_indices:
-                    if len(self.all_jobs) >= limit:
-                        logging.info(f"Reached limit of {limit} jobs")
+                    if len(self.seen_requisition_ids) >= limit:
+                        logging.info(f"Reached limit of {limit} unique jobs")
                         break
 
                     # ── Peek req_id without clicking ──
+                    # seen_requisition_ids guards within-run DOM duplicates only.
+                    # all_jobs collects EVERY successfully extracted job —
+                    # Supabase upsert handles cross-run dedup via jr_no conflict key.
                     peeked_req = self._peek_req_id_from_list_item(idx)
                     if peeked_req and peeked_req in self.seen_requisition_ids:
-                        logging.info(f"  ~ Index {idx}: req {peeked_req} already seen — skip click")
+                        logging.info(f"  ~ Index {idx}: req {peeked_req} already extracted this run — skip click")
                         high_water_mark = idx + 1
                         continue
 
@@ -742,6 +749,7 @@ class SAPJobListingsScraper:
                         if details and details.get('requisition_id'):
                             req_id = details['requisition_id']
                             if req_id not in self.seen_requisition_ids:
+                                # First time seeing this req_id this run — add to results
                                 self.all_jobs.append(details)
                                 self.seen_requisition_ids.add(req_id)
                                 logging.info(
@@ -749,7 +757,8 @@ class SAPJobListingsScraper:
                                     f"{details.get('job_title')} ({req_id})"
                                 )
                             else:
-                                logging.info(f"  ~ Index {idx}: req {req_id} duplicate after click — skip")
+                                # Already extracted this req_id earlier in this run
+                                logging.info(f"  ~ Index {idx}: req {req_id} duplicate within run — skip")
                         else:
                             logging.warning(f"  ✗ No details for index {idx} — queued for retry")
                             self.failed_indices.append(idx)
@@ -759,7 +768,7 @@ class SAPJobListingsScraper:
 
                     high_water_mark = idx + 1
 
-            if len(self.all_jobs) >= limit:
+            if len(self.seen_requisition_ids) >= limit:
                 break
 
             # ── 3. Scroll to trigger SAP growing list ──
@@ -1037,16 +1046,32 @@ def main():
             scraper.retry_failed()
 
         # ── Safety check — abort if nothing was extracted ──
-        if len(scraper.all_jobs) == 0:
+        # Use seen_requisition_ids as the true count — all_jobs may be smaller
+        # if some runs deduplicated within-run, but seen_requisition_ids reflects
+        # every unique job the scraper successfully identified this session.
+        total_seen = len(scraper.seen_requisition_ids)
+        total_jobs = len(scraper.all_jobs)
+        logging.info(f"Extraction complete: {total_jobs} jobs in all_jobs, {total_seen} unique req IDs seen")
+
+        if total_seen == 0:
             logging.error(
-                "CRITICAL FAILURE: Scraper extracted ZERO jobs! "
+                "CRITICAL FAILURE: Scraper found ZERO unique requisition IDs! "
                 "This may indicate: login failure, page structure change, or extraction error. "
                 "Aborting upload/deactivation to prevent data loss."
             )
             logging.info("Script terminating without modifying database.")
             return
 
-        logging.info(f"Total jobs extracted: {len(scraper.all_jobs)}")
+        if total_jobs == 0 and total_seen > 0:
+            logging.error(
+                f"CRITICAL FAILURE: seen_requisition_ids has {total_seen} entries but all_jobs is empty. "
+                "This means all extracted jobs were incorrectly treated as within-run duplicates. "
+                "Aborting to prevent false deactivation of all DB records."
+            )
+            logging.info("Script terminating without modifying database.")
+            return
+
+        logging.info(f"Total jobs to upload: {total_jobs}")
 
         # ── Save Excel backup ──
         scraper.save_excel()

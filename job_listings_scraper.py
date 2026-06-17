@@ -229,7 +229,22 @@ class SAPJobListingsScraper:
             """
         )
 
+    def _text_is_complete(self, text):
+        """Return True if the panel text has enough content to skip scrolling."""
+        if not text:
+            return False
+        t = text.upper()
+        return (
+            'REQUISITION ID' in t
+            and ('POSTING' in t or 'JOB DETAILS' in t)
+        )
+
     def _scroll_right_panel_and_get_job_details(self):
+        # Try extracting immediately — most panels already have full content visible
+        quick_text = self._extract_right_panel_text()
+        if self._text_is_complete(quick_text):
+            return quick_text
+
         right_panel = None
         try:
             right_panel = self.driver.find_element(
@@ -242,17 +257,25 @@ class SAPJobListingsScraper:
             pass
 
         if right_panel:
-            for _ in range(10):
-                self.driver.execute_script("arguments[0].scrollTop += 400;", right_panel)
-                time.sleep(0.8)
+            for _ in range(6):
+                self.driver.execute_script("arguments[0].scrollTop += 500;", right_panel)
+                time.sleep(0.4)
+                text = self._extract_right_panel_text()
+                if self._text_is_complete(text):
+                    self.driver.execute_script("arguments[0].scrollTop = 0;", right_panel)
+                    return text
             self.driver.execute_script("arguments[0].scrollTop = 0;", right_panel)
         else:
-            for _ in range(8):
-                self.driver.execute_script("window.scrollBy(0, 400);")
-                time.sleep(0.8)
+            for _ in range(5):
+                self.driver.execute_script("window.scrollBy(0, 500);")
+                time.sleep(0.4)
+                text = self._extract_right_panel_text()
+                if self._text_is_complete(text):
+                    self.driver.execute_script("window.scrollTo(0, 0);")
+                    return text
             self.driver.execute_script("window.scrollTo(0, 0);")
 
-        time.sleep(1.0)
+        time.sleep(0.5)
         return self._extract_right_panel_text()
 
     # ================== RECRUITER EMAIL ==================
@@ -343,7 +366,7 @@ class SAPJobListingsScraper:
         )
         logging.info(f"Contact card open result: {result}")
 
-        for _ in range(8):
+        for _ in range(5):
             try:
                 popovers = self.driver.find_elements(
                     By.XPATH,
@@ -355,7 +378,7 @@ class SAPJobListingsScraper:
                     return True
             except Exception:
                 pass
-            time.sleep(0.5)
+            time.sleep(0.3)
 
         icons = self.driver.find_elements(
             By.CSS_SELECTOR, "[data-sap-ui*='quickViewDetails'], [id*='quickViewDetails']"
@@ -378,7 +401,7 @@ class SAPJobListingsScraper:
         return False
 
     def _extract_contact_from_popover(self):
-        time.sleep(1.0)
+        time.sleep(0.5)
 
         try:
             raw = self.driver.execute_script(
@@ -562,8 +585,8 @@ class SAPJobListingsScraper:
             )
 
             new_req_id = prev_req_id
-            for _ in range(20):
-                time.sleep(0.6)
+            for _ in range(15):
+                time.sleep(0.3)
                 try:
                     new_req_id = self.driver.execute_script(
                         """
@@ -790,7 +813,7 @@ class SAPJobListingsScraper:
             if not scrolled:
                 self.driver.execute_script("window.scrollBy(0, 400);")
 
-            time.sleep(2.5)
+            time.sleep(1.5)
 
             # ── 4. Log if SAP loaded more items ──
             new_count = len(self._get_visible_jobs())

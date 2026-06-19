@@ -985,16 +985,18 @@ class SAPJobListingsScraper:
         now_iso = datetime.now().isoformat()
 
         # Fetch post-upload DB state
-        resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
-        all_db_records = {r["jr_no"]: r["jr_status"] for r in (resp.data or [])}
+        resp = supabase.table("jr_master").select("jr_no, jr_status, company_name").limit(10000).execute()
+        all_db_records = {r["jr_no"]: r for r in (resp.data or [])}
         logging.info(f"Total records in DB (post-upload): {len(all_db_records)}")
 
         batch_size = 50
 
-        # ── 1. DEACTIVATE — in DB but missing from today's extract ──
+        # ── 1. DEACTIVATE — in DB but missing from today's extract (only for company_name = 'BS') ──
         to_deactivate = [
-            jr_no for jr_no, status in all_db_records.items()
-            if jr_no not in extracted_jr_nos and status != "inactive"
+            jr_no for jr_no, rec in all_db_records.items()
+            if jr_no not in extracted_jr_nos
+            and rec.get("jr_status") != "inactive"
+            and rec.get("company_name") == "BS"
         ]
         logging.info(f"Records to mark inactive (missing from extract): {len(to_deactivate)}")
 

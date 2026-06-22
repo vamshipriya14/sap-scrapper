@@ -1054,7 +1054,16 @@ def main():
         scraper.navigate_to_job_listings_tab()
 
         # ── Snapshot DB BEFORE any changes ──
-        pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
+        for _attempt in range(5):
+            try:
+                pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
+                break
+            except Exception as _e:
+                logging.warning(f"Pre-upload snapshot attempt {_attempt + 1} failed: {_e}. Retrying in 5s…")
+                time.sleep(5)
+        else:
+            logging.error("Pre-upload snapshot failed after 5 attempts. Aborting to prevent data loss.")
+            return
         pre_upload_records  = {r["jr_no"]: r["jr_status"] for r in (pre_resp.data or [])}
         pre_upload_jr_nos   = set(pre_upload_records.keys())
         pre_upload_inactive = {jr_no for jr_no, s in pre_upload_records.items() if s == "inactive"}

@@ -123,6 +123,7 @@ def fetch_active_jobs() -> list:
     resp = (
         supabase.table("jr_master")
         .select(", ".join(COLUMNS_FROM_DB))
+        .eq("company_name", "BS")
         .gte("posting_end_date", today_iso)
         .neq("jr_status", "inactive")
         .order("posting_start_date", desc=True)
@@ -264,6 +265,7 @@ def _fetch_recent_changes(window_start: datetime, window_end: datetime) -> dict:
         new_resp = (
             supabase.table("jr_master")
             .select(cols)
+            .eq("company_name", "BS")
             .gte("created_date", start_iso)
             .lte("created_date", end_iso)
             .order("jr_no")
@@ -278,6 +280,7 @@ def _fetch_recent_changes(window_start: datetime, window_end: datetime) -> dict:
         legacy_new_resp = (
             supabase.table("jr_master")
             .select(cols)
+            .eq("company_name", "BS")
             .eq("jr_status", "new jr")
             .order("jr_no")
             .execute()
@@ -291,6 +294,7 @@ def _fetch_recent_changes(window_start: datetime, window_end: datetime) -> dict:
         deact_resp = (
             supabase.table("jr_master")
             .select(cols)
+            .eq("company_name", "BS")
             .eq("jr_status", "inactive")
             .gte("modified_date", start_iso)
             .lte("modified_date", end_iso)
@@ -331,7 +335,7 @@ def fetch_highlights(window_start: datetime, window_end: datetime) -> dict:
 def fetch_summary_counts(highlights: dict) -> dict:
     """Derive deactivated count from highlights; query DB for active + new jr counts."""
     try:
-        active_resp  = supabase.table("jr_master").select("jr_no").eq("jr_status", "active").execute()
+        active_resp  = supabase.table("jr_master").select("jr_no").eq("company_name", "BS").eq("jr_status", "active").execute()
         active_count = len(active_resp.data or [])
     except Exception as e:
         logging.warning(f"fetch_summary active count failed: {e}")

@@ -37,8 +37,6 @@ EMAIL_FROM          = os.getenv("EMAIL_FROM")
 EMAIL_TO            = os.getenv("EMAIL_TO", "")
 EMAIL_CC            = os.getenv("EMAIL_CC", "")
 REPORT_LOOKBACK_HOURS = int(os.getenv("REPORT_LOOKBACK_HOURS", "24"))
-NOTIFICATION_STATE_TABLE = os.getenv("NOTIFICATION_STATE_TABLE", "automation_state")
-NOTIFICATION_STATE_KEY = os.getenv("NOTIFICATION_STATE_KEY", "sap_daily_email_last_sent_at")
 
 for _var, _val in {
     "SUPABASE_URL": SUPABASE_URL, "SUPABASE_KEY": SUPABASE_KEY,
@@ -136,56 +134,8 @@ def fetch_active_jobs() -> list:
 HANDOFF_FILE = "scraper_handoff.json"
 
 
-def _fallback_report_start() -> datetime:
+def get_report_window_start() -> datetime:
     return datetime.now() - timedelta(hours=REPORT_LOOKBACK_HOURS)
-
-
-def get_last_successful_email_at() -> datetime:
-    """Return the last successful email checkpoint, or a 24h fallback."""
-    fallback = _fallback_report_start()
-    try:
-        resp = (
-            supabase.table(NOTIFICATION_STATE_TABLE)
-            .select("value")
-            .eq("key", NOTIFICATION_STATE_KEY)
-            .limit(1)
-            .execute()
-        )
-        rows = resp.data or []
-        if not rows or not rows[0].get("value"):
-            logging.info(
-                f"No notification checkpoint found; using {REPORT_LOOKBACK_HOURS}h fallback"
-            )
-            return fallback
-        return datetime.fromisoformat(str(rows[0]["value"]))
-    except Exception as e:
-        logging.warning(
-            f"Could not read notification checkpoint from {NOTIFICATION_STATE_TABLE}: {e}; "
-            f"using {REPORT_LOOKBACK_HOURS}h fallback"
-        )
-        return fallback
-
-
-def save_successful_email_checkpoint(sent_at: datetime) -> None:
-    """Persist the report window end after a successful email send."""
-    sent_at_iso = sent_at.isoformat()
-    payload = {
-        "key": NOTIFICATION_STATE_KEY,
-        "value": sent_at_iso,
-        "updated_at": datetime.now().isoformat(),
-    }
-    try:
-        supabase.table(NOTIFICATION_STATE_TABLE).upsert(
-            payload,
-            on_conflict="key",
-            ignore_duplicates=False,
-        ).execute()
-        logging.info(f"Notification checkpoint saved: {sent_at_iso}")
-    except Exception as e:
-        logging.error(
-            f"Could not save notification checkpoint to {NOTIFICATION_STATE_TABLE}: {e}"
-        )
-        raise
 
 
 def clear_legacy_new_jr_status() -> None:
@@ -623,7 +573,7 @@ def build_html_body(summary: dict, highlights: dict) -> str:
 def send_email():
     logging.info("=== Starting daily email job ===")
 
-    report_window_start = get_last_successful_email_at()
+    report_window_start = get_report_window_start()
     report_window_end = datetime.now()
     logging.info(
         f"Report window: {report_window_start.isoformat()} to "
@@ -685,7 +635,7 @@ def send_email():
             if resp.status_code == 202:
                 logging.info(f"Email sent | Subject: '{subject}'")
                 logging.info(f"   To: {EMAIL_TO}" + (f" | CC: {EMAIL_CC}" if EMAIL_CC else ""))
-                save_successful_email_checkpoint(report_window_end)
+
                 clear_legacy_new_jr_status()
                 break
             else:

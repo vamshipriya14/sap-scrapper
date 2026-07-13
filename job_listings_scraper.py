@@ -22,6 +22,7 @@ import time
 import re
 from datetime import datetime
 from dateutil import parser as dateutil_parser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import sys
@@ -61,6 +62,9 @@ class SAPJobListingsScraper:
         self.all_jobs = []
         self.seen_requisition_ids = set()
         self.failed_indices = []
+        self._existing_records = {}  # populated in main() before extraction starts
+        self._upload_executor = ThreadPoolExecutor(max_workers=2)
+        self._upload_futures = []
 
         options = webdriver.ChromeOptions()
         options.add_argument("--headless=new")
@@ -775,6 +779,7 @@ class SAPJobListingsScraper:
                                 # First time seeing this req_id this run — add to results
                                 self.all_jobs.append(details)
                                 self.seen_requisition_ids.add(req_id)
+                                self._upload_one(details)
                                 logging.info(
                                     f"  ✓ [{len(self.all_jobs)}] "
                                     f"{details.get('job_title')} ({req_id})"
@@ -844,6 +849,7 @@ class SAPJobListingsScraper:
                     if req_id not in self.seen_requisition_ids:
                         self.all_jobs.append(details)
                         self.seen_requisition_ids.add(req_id)
+                        self._upload_one(details)
                     logging.info(f"✓ Retry succeeded for DOM index {idx}")
                 else:
                     still_failed.append(idx)
@@ -971,6 +977,94 @@ class SAPJobListingsScraper:
                     logging.error(f"Upload attempt {attempt + 1} failed: {e}")
                     time.sleep(2)
 
+    # ================== BACKGROUND UPLOAD ==================
+    def _do_upload(self, job):
+        """Runs in background thread: format and upsert a single job to Supabase."""
+        from datetime import date as date_type
+        today   = datetime.now().date()
+        now_iso = datetime.now().isoformat()
+
+        req_id = self.clean(job.get("requisition_id"))
+        if not req_id:
+            return
+
+        end_date_str = job.get("posting_end_date")
+        parsed_end   = self.parse_date(end_date_str)
+        if parsed_end:
+            calc_status = "active" if date_type.fromisoformat(parsed_end) >= today else "inactive"
+        else:
+            calc_status = "active"
+
+        existing_rec    = self._existing_records.get(req_id)
+        existing_status = existing_rec["jr_status"] if existing_rec else None
+        created_date    = existing_rec.get("created_date") if existing_rec else now_iso
+
+        if existing_rec is None:
+            jr_status     = calc_status
+            modified_date = now_iso
+        elif existing_status != calc_status:
+            jr_status     = calc_status
+            modified_date = now_iso
+        else:
+            jr_status     = existing_status
+            modified_date = existing_rec.get("modified_date") or now_iso
+
+        record = {
+            "jr_no":              req_id,
+            "skill_name":         self.clean_text(job.get("job_title")),
+            "posting_start_date": self.parse_date(job.get("posting_start_date")),
+            "posting_end_date":   parsed_end,
+            "client_recruiter":   self.clean_text(job.get("recruiter_name")),
+            "recruiter_email":    self.clean(job.get("recruiter_email")).lower(),
+            "job_details":        job.get("job_details"),
+            "company_name":       "BS",
+            "jr_status":          jr_status,
+            "created_date":       created_date,
+            "modified_date":      modified_date,
+        }
+
+        if existing_rec is not None:
+            unchanged = (
+                existing_rec.get("skill_name")         == record["skill_name"]
+                and existing_rec.get("posting_start_date") == record["posting_start_date"]
+                and existing_rec.get("posting_end_date")   == record["posting_end_date"]
+                and existing_rec.get("client_recruiter")   == record["client_recruiter"]
+                and existing_rec.get("recruiter_email")    == record["recruiter_email"]
+                and existing_rec.get("jr_status")          == record["jr_status"]
+            )
+            if unchanged:
+                logging.info(f"  ~ [bg] Skipped (no change): {req_id}")
+                return
+
+        for attempt in range(3):
+            try:
+                supabase.table("jr_master").upsert(
+                    record, on_conflict="jr_no", ignore_duplicates=False
+                ).execute()
+                logging.info(f"  ↑ [bg] Uploaded: {req_id}")
+                return
+            except Exception as e:
+                logging.error(f"  [bg] Upload attempt {attempt + 1} failed for {req_id}: {e}")
+                time.sleep(2)
+
+    def _upload_one(self, job):
+        """Submit a job upload to the background thread pool (non-blocking)."""
+        future = self._upload_executor.submit(self._do_upload, job)
+        self._upload_futures.append(future)
+
+    def flush_uploads(self):
+        """Wait for all background uploads to complete. Call before DB reconciliation."""
+        if not self._upload_futures:
+            return
+        logging.info(f"Waiting for {len(self._upload_futures)} background uploads to finish...")
+        for future in as_completed(self._upload_futures):
+            try:
+                future.result()
+            except Exception as e:
+                logging.error(f"  Background upload error: {e}")
+        self._upload_futures.clear()
+        logging.info("All background uploads complete.")
+
     # ================== MARK INACTIVE / TRACK NEW / REACTIVATE ==================
     def mark_inactive_and_new(self, extracted_jr_nos: set, pre_upload_jr_nos: set):
         """
@@ -1032,6 +1126,7 @@ class SAPJobListingsScraper:
 
     # ================== CLOSE ==================
     def close(self):
+        self._upload_executor.shutdown(wait=True)
         self.driver.quit()
 
 
@@ -1053,10 +1148,12 @@ def main():
         # ── Ensure we're on the Job Listings tab ──
         scraper.navigate_to_job_listings_tab()
 
-        # ── Snapshot DB BEFORE any changes ──
+        # ── Snapshot DB BEFORE any changes (also used for immediate upload status) ──
         for _attempt in range(5):
             try:
-                pre_resp = supabase.table("jr_master").select("jr_no, jr_status").limit(10000).execute()
+                pre_resp = supabase.table("jr_master").select(
+                    "jr_no, jr_status, modified_date, created_date"
+                ).limit(10000).execute()
                 break
             except Exception as _e:
                 logging.warning(f"Pre-upload snapshot attempt {_attempt + 1} failed: {_e}. Retrying in 5s…")
@@ -1064,7 +1161,8 @@ def main():
         else:
             logging.error("Pre-upload snapshot failed after 5 attempts. Aborting to prevent data loss.")
             return
-        pre_upload_records  = {r["jr_no"]: r["jr_status"] for r in (pre_resp.data or [])}
+        pre_upload_data     = pre_resp.data or []
+        pre_upload_records  = {r["jr_no"]: r["jr_status"] for r in pre_upload_data}
         pre_upload_jr_nos   = set(pre_upload_records.keys())
         pre_upload_inactive = {jr_no for jr_no, s in pre_upload_records.items() if s == "inactive"}
         logging.info(
@@ -1072,7 +1170,10 @@ def main():
             f"{len(pre_upload_inactive)} inactive"
         )
 
-        # ── Parallel scroll + extract ──
+        # Feed full existing records to scraper for immediate per-job upload
+        scraper._existing_records = {r["jr_no"]: r for r in pre_upload_data}
+
+        # ── Parallel scroll + extract (uploads each job immediately) ──
         scraper.scroll_and_extract_all(limit=Limit)
 
         # ── Retry any failed indices ──
@@ -1125,9 +1226,8 @@ def main():
                 f"(back in extract): {reactivated[:10]}"
             )
 
-        # ── Upload / upsert all extracted records ──
-        new_data = scraper.deduplicate_data(scraper.all_jobs)
-        scraper.upload_supabase(new_data)
+        # ── Wait for all background uploads before reconciling ──
+        scraper.flush_uploads()
 
         # ── Mark missing records inactive; identify new JRs ──
         new_jr_nos, deactivated_jr_nos = scraper.mark_inactive_and_new(
@@ -1148,7 +1248,7 @@ def main():
             f"{len(reactivated)} reactivated"
         )
 
-        logging.info(f"DONE: {len(new_data)} records upserted to jr_master table")
+        logging.info(f"DONE: {len(scraper.all_jobs)} records upserted to jr_master table")
 
     finally:
         scraper.close()

@@ -254,8 +254,19 @@ class SAPCDPScraper:
             # Job applications
             jobs = []
             try:
-                rows = self.driver.find_elements(By.XPATH,
-                                                 "//tbody[contains(@id, 'candJobReqTable')]//tr[@role='row']")
+                # Wait for the table body to appear, then poll until row count stabilises
+                self.wait.until(EC.presence_of_element_located(
+                    (By.XPATH, "//tbody[contains(@id, 'candJobReqTable')]")
+                ))
+                prev_row_count = -1
+                rows = []
+                for _ in range(6):
+                    rows = self.driver.find_elements(By.XPATH,
+                                                     "//tbody[contains(@id, 'candJobReqTable')]//tr[@role='row']")
+                    if len(rows) == prev_row_count:
+                        break
+                    prev_row_count = len(rows)
+                    time.sleep(0.4)
 
                 for row in rows:
                     try:
@@ -496,6 +507,7 @@ class SAPCDPScraper:
             except Exception as e:
                 logging.error(f"Retry failed for candidate {idx}: {e}")
                 continue
+
 
         if self.failed_indices:
             logging.warning(f"Still failed after retry: {self.failed_indices}")

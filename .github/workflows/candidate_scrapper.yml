@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '30 * * * *'   # Every hour at :30 (offset from job listings at :00)
   workflow_dispatch:
+    inputs:
+      candidate_limit:
+        description: 'Max candidates to scrape'
+        required: false
+        default: '100'
+        type: string
 
 jobs:
   scrape:
@@ -68,6 +74,8 @@ jobs:
           ENVEOF
 
       - name: Run SAP candidate scraper
+        env:
+          CANDIDATE_LIMIT: ${{ github.event.inputs.candidate_limit || '100' }}
         run: python candidate_scrapper.py
 
       - name: Upload artifacts

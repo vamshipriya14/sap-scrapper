@@ -645,7 +645,8 @@ def main():
 
     try:
         scraper.login()
-        scraper.scroll_and_load_all(limit=100)
+        limit = int(os.getenv("CANDIDATE_LIMIT", "100"))
+        scraper.scroll_and_load_all(limit=limit)
         scraper.extract_all_loaded()
         scraper.save_excel()
 
